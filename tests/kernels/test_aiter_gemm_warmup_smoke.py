@@ -4,25 +4,19 @@
 """
 Smoke test for aiter_gemm_warmup with a real FP8 model.
 
-Loads Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, calls _collect_shapes and
-aiter_gemm_warmup without running inference.  Requires a live ROCm GPU
-and model weights in HuggingFace cache.
+Loads Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 with production compilation config
+(torch.compile mode=3, CUDA graphs, custom_ops) and verifies that aiter GEMM
+warmup fires correctly before graph capture.  Requires a live ROCm GPU and
+model weights in HuggingFace cache.
 
-Prerequisites (Python-only install, no C++ rebuild needed):
-    cd /path/to/vllm-fork
-    VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-
-    cd /path/to/aiter-main
-    uv pip install -e .
-
-Usage (TP=8 for full model, TP=1 for testing shape collection on a single GPU):
+Usage (TP=8 for full model, TP=1 for shape-collection check on a single GPU):
     VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=1 \
-    .venv/bin/python tests/kernels/test_aiter_gemm_warmup_smoke.py
+    python tests/kernels/test_aiter_gemm_warmup_smoke.py
 
 To also trigger tuning for missing shapes:
     VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=1 \
     VLLM_ROCM_USE_AITER_GEMM_AUTOTUNE=1 \
-    .venv/bin/python tests/kernels/test_aiter_gemm_warmup_smoke.py
+    python tests/kernels/test_aiter_gemm_warmup_smoke.py
 """
 
 import os
@@ -47,12 +41,16 @@ def main():
         enable_expert_parallel=True,
         # Limit memory to leave room for the warmup buffers.
         gpu_memory_utilization=0.85,
-        # Disable CUDA graph capture — we only want to inspect the loaded model.
-        enforce_eager=True,
         # Small context to speed up load.
         max_model_len=512,
         # Limit token budget to match the warmup M-value range.
         max_num_batched_tokens=MAX_TOKENS,
+        # Match production compilation config.
+        compilation_config={
+            "mode": 3,
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "custom_ops": ["-rms_norm"],
+        },
     )
 
     print("Model loaded. Extracting model runner ...")
