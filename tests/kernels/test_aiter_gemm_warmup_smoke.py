@@ -43,6 +43,8 @@ def main():
     llm = LLM(
         model=MODEL,
         tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+        # Required for MoE models (e.g. Qwen3-VL-30B-A3B) to distribute experts.
+        enable_expert_parallel=True,
         # Limit memory to leave room for the warmup buffers.
         gpu_memory_utilization=0.85,
         # Disable CUDA graph capture — we only want to inspect the loaded model.
@@ -97,8 +99,8 @@ def main():
     aiter_gemm_warmup(model, MAX_TOKENS)
     print("aiter_gemm_warmup completed successfully.")
 
-    del llm
     print("\nDone.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

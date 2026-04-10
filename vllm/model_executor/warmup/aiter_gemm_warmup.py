@@ -16,6 +16,7 @@ Environment variables:
 import torch
 
 import vllm.envs as envs
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
@@ -89,6 +90,12 @@ def aiter_gemm_warmup(model: torch.nn.Module, max_tokens: int) -> None:
 
     Called from kernel_warmup() before CUDA graph capture.
     """
+    # aiter tuning writes to a shared CSV on disk and compiles a shared .so.
+    # Running from multiple workers simultaneously would race-write the CSV,
+    # so only rank 0 checks coverage and runs the tuner; other workers skip.
+    if get_world_group().local_rank != 0:
+        return
+
     try:
         from aiter.utility.pretune import warmup as aiter_warmup
     except ImportError:
