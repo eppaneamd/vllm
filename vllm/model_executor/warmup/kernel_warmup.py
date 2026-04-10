@@ -48,7 +48,7 @@ def kernel_warmup(worker: "Worker"):
     if do_aiter_gemm_warmup:
         aiter_gemm_warmup(
             worker.get_model(),
-            worker.scheduler_config.max_num_batched_tokens,
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes,
         )
 
     enable_flashinfer_autotune = (
