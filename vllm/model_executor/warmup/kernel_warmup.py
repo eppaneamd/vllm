@@ -12,6 +12,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.aiter_gemm_warmup import aiter_gemm_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -35,6 +36,20 @@ def kernel_warmup(worker: "Worker"):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    # aiter GEMM warmup (ROCm only).
+    # Checks tuning coverage for all model GEMM shapes and logs warnings for
+    # any shapes not yet tuned for the live GPU.  Set
+    # VLLM_ROCM_USE_AITER_GEMM_AUTOTUNE=1 (read inside aiter_gemm_warmup) to
+    # also run the tuner automatically for missing shapes.
+    do_aiter_gemm_warmup = (
+        envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
+    )
+    if do_aiter_gemm_warmup:
+        aiter_gemm_warmup(
+            worker.get_model(),
+            worker.scheduler_config.max_num_batched_tokens,
+        )
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
