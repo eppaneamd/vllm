@@ -22,6 +22,17 @@ Example:
 
 Learn more about Ray Data's LLM integration:
 https://docs.ray.io/en/latest/data/working-with-llms.html
+
+Docker / Ray setup and compatibility
+
+The container may not include this file or Ray (ROCm OpenAI image or similar).
+Copy the script in (``docker cp .../batch_vlm_inference.py <container>:/tmp/``) or bind-mount
+your vLLM tree (e.g. ``-v /path/to/vllm:/workspace``) and run from there. Install once:
+``pip3 install "ray[data]>=2.44.1"``. Sanity check:
+``python3 -c "import ray; from ray.data.llm import build_llm_processor, vLLMEngineProcessorConfig; print(ray.__version__)"``.
+
+Ray Data LLM requires ``vllm.inputs.data``; use a vLLM revision that includes
+https://github.com/vllm-project/vllm/pull/46013 (or ``main`` after it merges).
 """
 
 import argparse
