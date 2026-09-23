@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -52,6 +53,7 @@ for _k, _attr in [
     ("F8_E4M3FNUZ", "float8_e4m3fnuz"),
     ("F8_E5M2", "float8_e5m2"),
     ("F8_E5M2FNUZ", "float8_e5m2fnuz"),
+    ("F8_E8M0", "float8_e8m0fnu"),
     ("C64", "complex64"),
     ("U64", "uint64"),
     ("U32", "uint32"),
@@ -67,6 +69,32 @@ try:
         _SAFETENSORS_DTYPE_MAP.update(safetensors.torch._TYPES)
 except ImportError:
     pass
+
+
+def _resolve_safetensors_dtype(
+    dtype_str: str, expected_itemsize: int | None = None
+) -> torch.dtype:
+    """Resolve safetensors dtype string to torch.dtype with robust float8/int fallbacks."""
+    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str)
+    if dtype is None:
+        if dtype_str.startswith("F8_"):
+            dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        elif dtype_str.startswith("U8") or dtype_str.startswith("I8"):
+            dtype = torch.uint8
+        else:
+            dtype = torch.bfloat16
+
+    if expected_itemsize is not None and getattr(dtype, "itemsize", None) != expected_itemsize:
+        if expected_itemsize == 1:
+            dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        elif expected_itemsize == 2:
+            dtype = torch.bfloat16
+        elif expected_itemsize == 4:
+            dtype = torch.float32
+        elif expected_itemsize == 8:
+            dtype = torch.float64
+
+    return dtype
 
 # Regex matching standard MoE expert slice keys across model families:
 # e.g.:
@@ -289,7 +317,7 @@ class SafetensorsMoEIndex:
 
                     shape = tuple(meta.get("shape", ()))
                     dtype_str = meta.get("dtype", "BF16")
-                    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
+                    dtype = _resolve_safetensors_dtype(dtype_str)
 
                     slice_loc = MoESliceLocation(
                         shard_file=shard_file,
@@ -389,7 +417,7 @@ class SafetensorsMoEIndex:
 
                     shape = tuple(meta.get("shape", ()))
                     dtype_str = meta.get("dtype", "BF16")
-                    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
+                    dtype = _resolve_safetensors_dtype(dtype_str)
 
                     slice_loc = MoESliceLocation(
                         shard_file=shard_file,
@@ -811,8 +839,12 @@ def _stream_direct_io_broadcast(
                     continue
 
                 dtype_str = meta.get("dtype", "BF16")
-                dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
                 shape = tuple(meta.get("shape", ()))
+                prod_elems = math.prod(shape) if shape else 1
+                expected_itemsize = (t_len // prod_elems) if prod_elems > 0 else None
+                dtype = _resolve_safetensors_dtype(
+                    dtype_str, expected_itemsize=expected_itemsize
+                )
 
                 # Construct zero-copy tensor view from shared memory
                 byte_offset = data_start_offset + t_start
