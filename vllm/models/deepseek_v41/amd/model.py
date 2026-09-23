@@ -723,13 +723,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
                 continue
-            if ".ffn.shared_experts.w" in name and fuse_by_layer.get(
-                extract_layer_index(name), False
+            if (
+                (".ffn.shared_experts." in name or ".shared_experts." in name)
+                and fuse_by_layer.get(extract_layer_index(name), False)
             ):
-                name = name.replace(
-                    ".ffn.shared_experts.w",
-                    f".ffn.experts.{n_routed}.w",
-                )
+                name = name.replace(".shared_experts.down_proj", f".experts.{n_routed}.w2")
+                name = name.replace(".shared_experts.gate_proj", f".experts.{n_routed}.w1")
+                name = name.replace(".shared_experts.up_proj", f".experts.{n_routed}.w3")
+                name = name.replace(".shared_experts.w", f".experts.{n_routed}.w")
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
