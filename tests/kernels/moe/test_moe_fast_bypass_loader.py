@@ -823,7 +823,8 @@ def test_kimi_k3_load_weights_o1_fast_path(synthetic_moe_checkpoint):
     )
 
     import re
-    expert_2d_dict = {}
+    from collections import defaultdict
+    expert_2d_dict = defaultdict(list)
     expert_fused_list = []
     _EXPERT_SUB_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
     for item in expert_params_mapping:
@@ -832,7 +833,7 @@ def test_kimi_k3_load_weights_o1_fast_path(synthetic_moe_checkpoint):
         if m is not None:
             eid = int(m.group(1))
             proj = m.group(2)
-            expert_2d_dict[(eid, proj)] = item
+            expert_2d_dict[(eid, proj)].append(item)
         else:
             expert_fused_list.append(item)
 
@@ -845,19 +846,25 @@ def test_kimi_k3_load_weights_o1_fast_path(synthetic_moe_checkpoint):
         assert m is not None, f"Key {name} failed regex search"
         eid = int(m.group(1))
         proj = m.group(2)
-        item = expert_2d_dict.get((eid, proj))
-        assert item is not None, f"Key {name} missing in expert_2d_dict"
-        expert_param_name, expert_weight_name, expert_id, expert_shard_id = item
-        name_mapped = name.replace(expert_weight_name, expert_param_name)
-        param = params_dict[name_mapped]
-        weight_loader = getattr(param, "weight_loader", layer.weight_loader)
-        weight_loader(
-            param,
-            loaded_weight,
-            name_mapped,
-            expert_id=expert_id,
-            shard_id=expert_shard_id,
-        )
+        items = expert_2d_dict.get((eid, proj))
+        assert items is not None, f"Key {name} missing in expert_2d_dict"
+        matched = False
+        for expert_param_name, expert_weight_name, expert_id, expert_shard_id in items:
+            if expert_weight_name not in name:
+                continue
+            name_mapped = name.replace(expert_weight_name, expert_param_name)
+            param = params_dict[name_mapped]
+            weight_loader = getattr(param, "weight_loader", layer.weight_loader)
+            weight_loader(
+                param,
+                loaded_weight,
+                name_mapped,
+                expert_id=expert_id,
+                shard_id=expert_shard_id,
+            )
+            matched = True
+            break
+        assert matched, f"Key {name} failed to match candidate items"
 
     prefix0 = "model.layers.0.mlp.experts"
     for e in range(num_experts):
@@ -868,6 +875,126 @@ def test_kimi_k3_load_weights_o1_fast_path(synthetic_moe_checkpoint):
         assert torch.equal(layer.w13_weight[e, :intermediate_dim, :], expected_gate)
         assert torch.equal(layer.w13_weight[e, intermediate_dim:, :], expected_up)
         assert torch.equal(layer.w2_weight[e], expected_down)
+
+
+def test_kimi_k3_expert_dict_scale_collision():
+    """Verifies that expert_2d_dict preserves both base weight and scale mappings without collision."""
+    from collections import defaultdict
+    import re
+
+    # Simulate mapping tuples with both weight and weight_scale for the same (eid, proj)
+    expert_params_mapping = [
+        ("mlp.experts.w13_weight", "mlp.experts.0.gate_proj.weight", 0, "w1"),
+        ("mlp.experts.w13_weight_scale", "mlp.experts.0.gate_proj.weight_scale", 0, "w1"),
+        ("mlp.experts.w2_weight", "mlp.experts.0.down_proj.weight", 0, "w2"),
+        ("mlp.experts.w2_weight_scale", "mlp.experts.0.down_proj.weight_scale", 0, "w2"),
+    ]
+
+    expert_2d_dict = defaultdict(list)
+    _EXPERT_SUB_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
+    for item in expert_params_mapping:
+        param_name, weight_name, expert_id, shard_id = item
+        m = _EXPERT_SUB_RE.search(weight_name)
+        assert m is not None
+        eid = int(m.group(1))
+        proj = m.group(2)
+        expert_2d_dict[(eid, proj)].append(item)
+
+    for items in expert_2d_dict.values():
+        items.sort(key=lambda x: len(x[1]), reverse=True)
+
+    # Both weight and scale must be present in the bucket
+    assert len(expert_2d_dict[(0, "gate_proj")]) == 2
+    assert len(expert_2d_dict[(0, "down_proj")]) == 2
+
+    # Verify matching for both weight and scale
+    test_names = [
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", "mlp.experts.w13_weight"),
+        ("model.layers.0.mlp.experts.0.gate_proj.weight_scale", "mlp.experts.w13_weight_scale"),
+        ("model.layers.0.mlp.experts.0.down_proj.weight", "mlp.experts.w2_weight"),
+        ("model.layers.0.mlp.experts.0.down_proj.weight_scale", "mlp.experts.w2_weight_scale"),
+    ]
+
+    for incoming_name, expected_param in test_names:
+        m = _EXPERT_SUB_RE.search(incoming_name)
+        assert m is not None
+        eid = int(m.group(1))
+        proj = m.group(2)
+        candidates = expert_2d_dict.get((eid, proj))
+        assert candidates is not None
+        matched_param = None
+        for expert_param_name, expert_weight_name, _, _ in candidates:
+            if expert_weight_name in incoming_name:
+                matched_param = expert_param_name
+                break
+        assert matched_param == expected_param, f"Expected {expected_param}, got {matched_param}"
+
+
+def test_fse_shared_expert_shard_inversion():
+    """Verifies that checkpoints ordering shared experts before routed experts do not duplicate prefix."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        num_routed = 4
+        hidden_dim = 64
+        intermediate_dim = 128
+
+        # Shard 0: contains shared expert weights ONLY
+        shard0_weights = {
+            "model.layers.0.mlp.shared_experts.gate_proj.weight": torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            ),
+            "model.layers.0.mlp.shared_experts.up_proj.weight": torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            ),
+            "model.layers.0.mlp.shared_experts.down_proj.weight": torch.randn(
+                hidden_dim, intermediate_dim, dtype=torch.bfloat16
+            ),
+        }
+        shard0_path = os.path.join(tmpdir, "model-00001-of-00002.safetensors")
+        save_file(shard0_weights, shard0_path)
+
+        # Shard 1: contains routed expert weights
+        shard1_weights = {}
+        for e in range(num_routed):
+            shard1_weights[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            )
+            shard1_weights[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            )
+            shard1_weights[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+                hidden_dim, intermediate_dim, dtype=torch.bfloat16
+            )
+        shard1_path = os.path.join(tmpdir, "model-00002-of-00002.safetensors")
+        save_file(shard1_weights, shard1_path)
+
+        # Build index from shards ordered [shard0, shard1]
+        index = SafetensorsMoEIndex.build(
+            [shard0_path, shard1_path],
+            fse_enabled=True,
+            n_shared_experts=1,
+        )
+
+        # Ensure no duplicate prefix like "model.layers.0.mlp.experts.experts" exists
+        for layer_prefix in index.moe_layers:
+            assert ".experts.experts" not in layer_prefix, f"Found duplicated prefix: {layer_prefix}"
+
+        # Verify streaming in Mode 2 yields virtual slot num_routed
+        stream = list(
+            fast_bypass_safetensors_iterator(
+                [shard0_path, shard1_path],
+                direct_vram_mode=True,
+                fse_enabled=True,
+                n_shared_experts=1,
+            )
+        )
+        yielded_keys = {name: tensor for name, tensor in stream}
+        assert f"model.layers.0.mlp.experts.{num_routed}.gate_proj.weight" in yielded_keys
+        assert f"model.layers.0.mlp.experts.{num_routed}.down_proj.weight" in yielded_keys
+        assert torch.equal(
+            yielded_keys[f"model.layers.0.mlp.experts.{num_routed}.gate_proj.weight"],
+            shard0_weights["model.layers.0.mlp.shared_experts.gate_proj.weight"],
+        )
+
 
 
 

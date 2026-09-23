@@ -365,7 +365,7 @@ class SafetensorsMoEIndex:
                     )
                     routed_prefix = next(
                         (p for p in self.moe_layers if p.startswith(prefix)),
-                        f"{prefix}.experts",
+                        prefix,
                     )
                     if routed_prefix not in self.moe_layers:
                         self.moe_layers[routed_prefix] = MoELayerPlan(

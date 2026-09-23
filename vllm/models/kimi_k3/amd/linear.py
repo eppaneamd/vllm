@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import defaultdict
 from collections.abc import Iterable
 import inspect
 import re
@@ -458,13 +459,8 @@ class KimiMLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        output: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        out = self.mla_attn(positions, hidden_states)
-        if output is not None:
-            output[:] = out
-            return None
-        return out
+    ) -> torch.Tensor:
+        return self.mla_attn(positions, hidden_states)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -921,7 +917,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             expert_params_mapping = []
 
         # Pre-index expert_params_mapping to eliminate O(N_keys * N_experts) string scan
-        expert_2d_dict: dict[tuple[int, str], tuple[str, str, int, str]] = {}
+        expert_2d_dict: dict[tuple[int, str], list[tuple[str, str, int, str]]] = (
+            defaultdict(list)
+        )
         expert_fused_list: list[tuple[str, str, int, str]] = []
         _EXPERT_SUB_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
         for item in expert_params_mapping:
@@ -930,9 +928,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             if m is not None:
                 eid = int(m.group(1))
                 proj = m.group(2)
-                expert_2d_dict[(eid, proj)] = item
+                expert_2d_dict[(eid, proj)].append(item)
             else:
                 expert_fused_list.append(item)
+
+        for items in expert_2d_dict.values():
+            items.sort(key=lambda x: len(x[1]), reverse=True)
+        expert_fused_list.sort(key=lambda x: len(x[1]), reverse=True)
 
         params_dict = dict(self.named_parameters())
         # Under the MXFP4 quant interface the routed experts register unpacked
@@ -988,11 +990,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     if m is not None:
                         eid = int(m.group(1))
                         proj = m.group(2)
-                        item = expert_2d_dict.get((eid, proj))
-                        if item is not None:
-                            expert_param_name, expert_weight_name, expert_id, expert_shard_id = item
-                            name_mapped = name.replace(expert_weight_name, expert_param_name)
-                            if not is_pp_missing_parameter(name_mapped, self):
+                        items = expert_2d_dict.get((eid, proj))
+                        if items is not None:
+                            for (
+                                expert_param_name,
+                                expert_weight_name,
+                                expert_id,
+                                expert_shard_id,
+                            ) in items:
+                                if expert_weight_name not in name:
+                                    continue
+                                name_mapped = name.replace(
+                                    expert_weight_name, expert_param_name
+                                )
+                                if is_pp_missing_parameter(name_mapped, self):
+                                    continue
                                 name = name_mapped
                                 param = params_dict[name]
                                 weight_loader = param.weight_loader
@@ -1004,6 +1016,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                                     shard_id=expert_shard_id,
                                 )
                                 matched_expert = True
+                                break
                     if not matched_expert and expert_fused_list:
                         for (
                             expert_param_name,
