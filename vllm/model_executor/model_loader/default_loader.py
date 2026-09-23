@@ -291,6 +291,24 @@ class DefaultModelLoader(BaseModelLoader):
                         fse_enabled = os.environ.get(
                             "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "0"
                         ).lower() in ("1", "true")
+                    direct_io_mode = extra_config.get("direct_io_mode")
+                    if direct_io_mode is None:
+                        env_dio = os.environ.get("VLLM_MOE_DIRECT_IO")
+                        if env_dio is not None:
+                            direct_io_mode = env_dio.lower() in ("1", "true")
+
+                    tp_size = 1
+                    tp_rank = 0
+                    try:
+                        from vllm.distributed import (
+                            get_tensor_model_parallel_rank,
+                            get_tensor_model_parallel_world_size,
+                        )
+                        tp_size = get_tensor_model_parallel_world_size()
+                        tp_rank = get_tensor_model_parallel_rank()
+                    except Exception:
+                        pass
+
                     weights_iterator = fast_bypass_safetensors_iterator(
                         hf_weights_files,
                         local_expert_ids=self.local_expert_ids,
@@ -300,6 +318,7 @@ class DefaultModelLoader(BaseModelLoader):
                         fse_enabled=fse_enabled,
                         n_shared_experts=n_shared_experts,
                         direct_vram_mode=extra_config.get("direct_vram_mode"),
+                        direct_io_mode=direct_io_mode,
                         direct_vram_threshold_gb=extra_config.get(
                             "direct_vram_threshold_gb", 100.0
                         ),
@@ -307,6 +326,8 @@ class DefaultModelLoader(BaseModelLoader):
                             "drop_cache_after_load",
                             os.environ.get("VLLM_MOE_DROP_CACHE", "0") in ("1", "true")
                         ),
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
                     )
                 elif extra_config.get("enable_multithread_load"):
                     weights_iterator = multi_thread_safetensors_weights_iterator(

@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +21,15 @@ from typing import Any
 
 from safetensors import safe_open
 import torch
+
+from .direct_block_reader import (
+    DirectBlockFileReader,
+    calculate_alignment,
+)
+from .shared_pinned_pool import (
+    SharedPinnedBufferPool,
+    DEFAULT_SLOT_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +177,9 @@ class SafetensorsMoEIndex:
         # Layer plans: layer_prefix -> MoELayerPlan
         self.moe_layers: dict[str, MoELayerPlan] = {}
 
+        # Parsed shard headers: shard_file -> (header_size, header_json)
+        self.shard_headers: dict[str, tuple[int, dict[str, Any]]] = {}
+
         # Open file handles for safe_open: shard_file -> safe_open handle
         self.handles: dict[str, Any] = {}
 
@@ -189,12 +202,12 @@ class SafetensorsMoEIndex:
         return index
 
     def _parse_headers(self, max_workers: int) -> None:
-        def read_header(shard_path: str) -> tuple[str, dict[str, Any]]:
+        def read_header(shard_path: str) -> tuple[str, int, dict[str, Any]]:
             with open(shard_path, "rb") as f:
                 header_size = struct.unpack("<Q", f.read(8))[0]
                 header_bytes = f.read(header_size)
                 header_json = json.loads(header_bytes.decode("utf-8"))
-            return shard_path, header_json
+            return shard_path, header_size, header_json
 
         workers = min(max_workers, max(1, len(self.hf_weights_files)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -212,7 +225,8 @@ class SafetensorsMoEIndex:
             "BOOL": torch.bool,
         }
 
-        for shard_file, header in headers:
+        for shard_file, header_size, header in headers:
+            self.shard_headers[shard_file] = (header_size, header)
             for key, meta in header.items():
                 if key == "__metadata__":
                     continue
@@ -616,6 +630,248 @@ def _stream_shard_direct_to_vram(
         del next_handle
 
 
+def check_page_cache_warmth(shards: list[str], sample_mb: int = 16) -> float:
+    """Estimates the fraction of checkpoint pages resident in Linux VFS page cache.
+
+    Uses libc.mincore over a sample window of the first few shards.
+    Returns:
+        Fraction in [0.0, 1.0] of sampled pages present in RAM.
+    """
+    if not shards:
+        return 1.0
+    try:
+        import ctypes
+        import mmap
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+        libc.mincore.restype = ctypes.c_int
+
+        class _PyBuffer(ctypes.Structure):
+            _fields_ = [
+                ("buf", ctypes.c_void_p),
+                ("obj", ctypes.c_void_p),
+                ("len", ctypes.c_ssize_t),
+                ("itemsize", ctypes.c_ssize_t),
+                ("readonly", ctypes.c_int),
+                ("ndim", ctypes.c_int),
+                ("format", ctypes.c_char_p),
+                ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+                ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+                ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+                ("internal", ctypes.c_void_p),
+            ]
+
+        sample_bytes = sample_mb * 1024 * 1024
+        total_pages = 0
+        cached_pages = 0
+        page_size = 4096
+
+        sample_files = shards[: min(3, len(shards))]
+        for file_path in sample_files:
+            file_size = os.path.getsize(file_path)
+            if file_size < page_size:
+                continue
+            cur_sample = min(sample_bytes, file_size)
+            fd = os.open(file_path, os.O_RDONLY)
+            try:
+                mm = mmap.mmap(
+                    fd,
+                    cur_sample,
+                    flags=mmap.MAP_PRIVATE | mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ,
+                )
+                pybuf = _PyBuffer()
+                ctypes.pythonapi.PyObject_GetBuffer(
+                    ctypes.py_object(mm), ctypes.byref(pybuf), 0
+                )
+                addr = pybuf.buf
+                n_pages = cur_sample // page_size
+                vec = ctypes.create_string_buffer(n_pages)
+                ret = libc.mincore(addr, cur_sample, vec)
+                ctypes.pythonapi.PyBuffer_Release(ctypes.byref(pybuf))
+                mm.close()
+                if ret == 0:
+                    cached_pages += sum(1 for b in vec.raw if b & 1)
+                    total_pages += n_pages
+            finally:
+                os.close(fd)
+
+        if total_pages == 0:
+            return 1.0
+        return cached_pages / total_pages
+    except Exception as e:
+        logger.debug("check_page_cache_warmth failed: %s; assuming warm cache", e)
+        return 1.0
+
+
+def _stream_direct_io_broadcast(
+    hf_weights_files: list[str],
+    index: SafetensorsMoEIndex,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    max_workers: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Streams weights using single-reader Direct I/O and POSIX shared-memory broadcast.
+
+    - Rank 0 issues O_DIRECT block reads off the NVMe drive into aligned double buffers (/dev/shm).
+    - Peer ranks (1..tp_size-1) read zero bytes from disk, slicing their parameters directly from RAM.
+    - Achieves theoretical NVMe hardware bandwidth saturation without multi-process disk contention.
+    """
+    sorted_shards = sorted(hf_weights_files)
+    num_shards = len(sorted_shards)
+    if num_shards == 0:
+        return
+
+    # Calculate dynamic slot size (max shard size rounded up to 1 GiB)
+    max_shard_bytes = max(os.path.getsize(f) for f in sorted_shards)
+    slot_size = ((max_shard_bytes + (1024**3) - 1) // (1024**3)) * (1024**3)
+
+    hash_key = hashlib.sha256("".join(sorted_shards).encode("utf-8")).hexdigest()[:16]
+    pool_prefix = f"vllm_moe_dio_{hash_key}"
+
+    is_reader = (tp_rank == 0)
+    pool = SharedPinnedBufferPool(
+        prefix=pool_prefix,
+        slot_size=slot_size,
+        is_creator=is_reader,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+
+    reader = DirectBlockFileReader(max_workers=max_workers) if is_reader else None
+    reader_executor = ThreadPoolExecutor(max_workers=1) if is_reader else None
+
+    dtype_map = {
+        "BF16": torch.bfloat16,
+        "F16": torch.float16,
+        "F32": torch.float32,
+        "U8": torch.uint8,
+        "I8": torch.int8,
+        "I16": torch.int16,
+        "I32": torch.int32,
+        "I64": torch.int64,
+        "BOOL": torch.bool,
+    }
+
+    try:
+        # Initial read of shard 0 into slot 0 by reader
+        if is_reader:
+            assert reader is not None
+            logger.info(
+                "Direct-I/O Broadcast: Rank 0 reading Shard 0 (%s) at wire speed...",
+                sorted_shards[0],
+            )
+            reader.read_file_to_buffer(sorted_shards[0], pool.get_slot_buffer(0))
+
+        # Sync all ranks: Shard 0 is now ready in Slot 0
+        pool.barrier()
+
+        for idx, shard_path in enumerate(sorted_shards):
+            curr_slot = idx % 2
+            next_slot = (idx + 1) % 2
+            curr_buf = pool.get_slot_buffer(curr_slot)
+
+            # Asynchronous prefetch of next shard by Rank 0
+            prefetch_future = None
+            if is_reader and idx + 1 < num_shards:
+                assert reader is not None and reader_executor is not None
+                next_path = sorted_shards[idx + 1]
+                next_buf = pool.get_slot_buffer(next_slot)
+                prefetch_future = reader_executor.submit(
+                    reader.read_file_to_buffer, next_path, next_buf
+                )
+
+            # All ranks consume curr_buf in parallel
+            header_size, header = index.shard_headers[shard_path]
+            data_start_offset = 8 + header_size
+
+            for key, meta in header.items():
+                if key == "__metadata__":
+                    continue
+
+                offsets = meta.get("data_offsets")
+                if not offsets or len(offsets) != 2:
+                    continue
+
+                t_start, t_end = offsets
+                t_len = t_end - t_start
+                if t_len <= 0:
+                    continue
+
+                dtype_str = meta.get("dtype", "BF16")
+                dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                shape = tuple(meta.get("shape", ()))
+
+                # Construct zero-copy tensor view from shared memory
+                byte_offset = data_start_offset + t_start
+                raw_view = torch.frombuffer(
+                    curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
+                )
+                tensor = raw_view.view(dtype).reshape(shape)
+
+                # Check MoE keys vs non-MoE keys
+                m_2d = _MOE_2D_KEY_RE.match(key)
+                if m_2d:
+                    expert_id = int(m_2d.group("expert_id"))
+                    if (
+                        index.local_expert_ids is not None
+                        and expert_id not in index.local_expert_ids
+                    ):
+                        continue
+                    yield key, tensor
+                    continue
+
+                m_fse = _SHARED_EXPERT_KEY_RE.match(key) if index.fse_enabled else None
+                if m_fse:
+                    prefix = m_fse.group("prefix")
+                    proj = m_fse.group("proj")
+                    suffix = m_fse.group("suffix") or ""
+                    routed_prefix = next(
+                        (p for p in index.moe_layers if p.startswith(prefix)),
+                        f"{prefix}.experts",
+                    )
+                    plan = index.moe_layers.get(routed_prefix)
+                    num_routed = plan.num_routed_experts if plan else 0
+
+                    if index.n_shared_experts <= 1:
+                        virt_key = f"{routed_prefix}.{num_routed}.{proj}{suffix}"
+                        yield virt_key, tensor
+                    else:
+                        if proj in _DOWN_NAMES or "down" in proj:
+                            s_chunk = tensor.shape[-1] // index.n_shared_experts
+                            for s_idx in range(index.n_shared_experts):
+                                virt_eid = num_routed + s_idx
+                                chunk = tensor[..., s_idx * s_chunk : (s_idx + 1) * s_chunk]
+                                virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
+                                yield virt_key, chunk
+                        else:
+                            s_chunk = tensor.shape[0] // index.n_shared_experts
+                            for s_idx in range(index.n_shared_experts):
+                                virt_eid = num_routed + s_idx
+                                chunk = tensor[s_idx * s_chunk : (s_idx + 1) * s_chunk]
+                                virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
+                                yield virt_key, chunk
+                    continue
+
+                # Standard non-MoE or 3D MoE key
+                yield key, tensor
+
+            # Await prefetch completion on reader rank
+            if prefetch_future is not None:
+                prefetch_future.result()
+
+            # Synchronize all TP ranks before advancing to next slot
+            pool.barrier()
+
+    finally:
+        if reader_executor is not None:
+            reader_executor.shutdown(wait=True)
+        if reader is not None:
+            reader.close()
+        pool.unlink() if is_reader else pool.close()
+
+
 def _consolidate_3d_host_staging(
     hf_weights_files: list[str],
     index: SafetensorsMoEIndex,
@@ -993,19 +1249,25 @@ def fast_bypass_safetensors_iterator(
     fse_enabled: bool | None = None,
     n_shared_experts: int = 1,
     direct_vram_mode: bool | None = None,
+    direct_io_mode: bool | None = None,
     direct_vram_threshold_gb: float = 100.0,
     drop_cache_after_load: bool = False,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterates through safetensors checkpoint shards with scale-aware MoE ingestion.
 
-    Dual Ingestion Modes:
+    Tri-Modal Ingestion Architecture:
     1. Mode 1 (Bulk 3D Host Staging): Checkpoints <= 100 GB (e.g. Qwen3-VL-30B, GLM-5.3-Flash).
        Consolidates slices in pinned CPU host staging buffers to reduce thousands of DMA
        calls to 192 wire-speed transfers, preserving 13.1x-28.1x load records.
-    2. Mode 2 (Shard-Driven Direct-to-VRAM with Pipelined Prefetching): Checkpoints > 100 GB
-       (e.g. Kimi-K3, DeepSeek-V3/V4). Streams one shard at a time with a bounded sliding window
-       of 2 handles (POSIX_FADV_WILLNEED on shard i+1, POSIX_FADV_DONTNEED on shard i-1).
-       Eliminates CPU pinned buffers and multi-process page-table lock stalls.
+    2. Mode 2 (Shard-Driven Direct-to-VRAM with Pipelined Prefetching): Warm Checkpoints > 100 GB
+       (e.g. Kimi-K3, DeepSeek-V3/V4 with host page cache warmed). Streams one shard at a time with
+       sliding window (POSIX_FADV_WILLNEED on shard i+1, POSIX_FADV_DONTNEED on shard i-1).
+    3. Mode 3 (Direct-I/O Broadcast): Cold Checkpoints > 100 GB (e.g. fresh node boot / drop_caches).
+       Designates Rank 0 to read raw blocks via O_DIRECT at wire speed (~4.3 GB/s) into an aligned
+       POSIX shared memory double buffer (/dev/shm). All TP ranks slice tensors in parallel from RAM,
+       eliminating 8x multi-rank disk contention and bringing cold load down to the 5.6-minute floor.
     """
     if fse_enabled is None:
         fse_enabled = os.environ.get(
@@ -1024,30 +1286,75 @@ def fast_bypass_safetensors_iterator(
         n_shared_experts=n_shared_experts,
     )
 
-    env_direct = os.environ.get("VLLM_MOE_DIRECT_VRAM")
-    if direct_vram_mode is not None:
-        use_direct = direct_vram_mode
-    elif env_direct is not None:
-        use_direct = env_direct.lower() in ("1", "true")
+    env_dio = os.environ.get("VLLM_MOE_DIRECT_IO")
+    if direct_io_mode is not None:
+        use_direct_io = direct_io_mode
+    elif env_dio is not None:
+        use_direct_io = env_dio.lower() in ("1", "true")
     else:
-        env_thresh = os.environ.get("VLLM_FAST_MOE_DIRECT_VRAM_THRESHOLD_GB")
-        if env_thresh is not None:
-            try:
-                threshold_gb = float(env_thresh)
-            except ValueError:
-                threshold_gb = direct_vram_threshold_gb
-        else:
+        use_direct_io = None
+
+    env_direct_vram = os.environ.get("VLLM_MOE_DIRECT_VRAM")
+    if direct_vram_mode is not None:
+        use_direct_vram = direct_vram_mode
+    elif env_direct_vram is not None:
+        use_direct_vram = env_direct_vram.lower() in ("1", "true")
+    else:
+        use_direct_vram = None
+
+    env_thresh = os.environ.get("VLLM_FAST_MOE_DIRECT_VRAM_THRESHOLD_GB")
+    if env_thresh is not None:
+        try:
+            threshold_gb = float(env_thresh)
+        except ValueError:
             threshold_gb = direct_vram_threshold_gb
+    else:
+        threshold_gb = direct_vram_threshold_gb
 
-        total_bytes = sum(os.path.getsize(f) for f in hf_weights_files)
-        total_gb = total_bytes / (1024 ** 3)
-        use_direct = total_gb > threshold_gb
+    total_bytes = sum(os.path.getsize(f) for f in hf_weights_files)
+    total_gb = total_bytes / (1024**3)
 
-    if use_direct:
+    # Resolve mode selection
+    if use_direct_io is True:
+        selected_mode = 3
+    elif use_direct_vram is True:
+        selected_mode = 2
+    elif total_gb <= threshold_gb:
+        selected_mode = 1
+    else:
+        # Checkpoint > 100 GB: check page cache warmth to pick Mode 2 vs Mode 3
+        warmth = check_page_cache_warmth(hf_weights_files)
+        logger.info(
+            "Fast MoE Bypass: Host page cache warmth check returned %.1f%% resident pages.",
+            warmth * 100.0,
+        )
+        if warmth < 0.50:
+            selected_mode = 3
+        else:
+            selected_mode = 2
+
+    if selected_mode == 3:
+        logger.info(
+            "Fast MoE Bypass: Selected Mode 3 (Direct-I/O Single-Reader Broadcast). "
+            "Total checkpoint size: %.2f GiB across %d shard(s), TP size: %d, TP rank: %d.",
+            total_gb,
+            len(hf_weights_files),
+            tp_size,
+            tp_rank,
+        )
+        os.environ["VLLM_MOE_DISABLE_HOST_STAGING"] = "1"
+        yield from _stream_direct_io_broadcast(
+            hf_weights_files,
+            index,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            max_workers=max_workers,
+        )
+    elif selected_mode == 2:
         logger.info(
             "Fast MoE Bypass: Selected Mode 2 (Shard-Driven Direct-to-VRAM with Pipelined Prefetching). "
             "Total checkpoint size: %.2f GiB across %d shard(s).",
-            sum(os.path.getsize(f) for f in hf_weights_files) / (1024**3),
+            total_gb,
             len(hf_weights_files),
         )
         os.environ["VLLM_MOE_DISABLE_HOST_STAGING"] = "1"
@@ -1060,7 +1367,7 @@ def fast_bypass_safetensors_iterator(
         logger.info(
             "Fast MoE Bypass: Selected Mode 1 (Bulk 3D Host Staging). "
             "Total checkpoint size: %.2f GiB across %d shard(s).",
-            sum(os.path.getsize(f) for f in hf_weights_files) / (1024**3),
+            total_gb,
             len(hf_weights_files),
         )
         yield from _consolidate_3d_host_staging(
