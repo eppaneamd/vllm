@@ -143,7 +143,16 @@ class DirectBlockFileReader:
 
         try:
             if use_o_direct:
-                return self._read_direct(fd, dest_buffer, file_offset, target_length, file_size)
+                try:
+                    return self._read_direct(fd, dest_buffer, file_offset, target_length, file_size)
+                except OSError as err:
+                    if not self.allow_fallback:
+                        raise
+                    logger.debug(
+                        "O_DIRECT read failed (%s); falling back to buffered I/O",
+                        err,
+                    )
+                    return self._read_buffered(fd, dest_buffer, file_offset, target_length)
             else:
                 return self._read_buffered(fd, dest_buffer, file_offset, target_length)
         finally:

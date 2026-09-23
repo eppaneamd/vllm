@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Asynchronous Direct Block I/O Weight Loader and Single-Reader Broadcast."""
 
+import mmap
 import os
 import tempfile
 from typing import Any
@@ -129,8 +130,9 @@ def test_direct_block_file_reader(synthetic_multishard_checkpoint):
     file_size = os.path.getsize(shard_0)
 
     reader = DirectBlockFileReader(chunk_size=64 * 1024, max_workers=2)
-    buf = bytearray(file_size + 4096)
-    mv = memoryview(buf)
+    aligned_buf_len = ((file_size + 4095) // 4096) * 4096
+    mm = mmap.mmap(-1, aligned_buf_len)
+    mv = memoryview(mm)
 
     try:
         n_read = reader.read_file_to_buffer(shard_0, mv, file_offset=0, length=file_size)
@@ -140,6 +142,8 @@ def test_direct_block_file_reader(synthetic_multishard_checkpoint):
             expected_bytes = f.read()
         assert bytes(mv[:file_size]) == expected_bytes
     finally:
+        mv.release()
+        mm.close()
         reader.close()
 
 
