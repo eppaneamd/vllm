@@ -1,0 +1,873 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for Fast MoE Safetensors Bypass Loader (Option C)."""
+
+import os
+import tempfile
+import pytest
+from safetensors.torch import save_file
+import torch
+
+from vllm.model_executor.model_loader.moe_fast_loader import (
+    SafetensorsMoEIndex,
+    fast_bypass_safetensors_iterator,
+)
+
+
+@pytest.fixture
+def synthetic_moe_checkpoint():
+    """Creates a temporary safetensors checkpoint with non-MoE and MoE weights."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        num_layers = 2
+        num_experts = 8
+        hidden_dim = 64
+        intermediate_dim = 128
+
+        weights = {}
+
+        # Non-MoE weights
+        weights["model.embed_tokens.weight"] = torch.randn(
+            100, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.norm.weight"] = torch.ones(hidden_dim, dtype=torch.bfloat16)
+
+        # MoE weights per layer
+        for l in range(num_layers):
+            weights[f"model.layers.{l}.input_layernorm.weight"] = torch.ones(
+                hidden_dim, dtype=torch.bfloat16
+            )
+            for e in range(num_experts):
+                weights[f"model.layers.{l}.mlp.experts.{e}.gate_proj.weight"] = (
+                    torch.randn(intermediate_dim, hidden_dim, dtype=torch.bfloat16)
+                )
+                weights[f"model.layers.{l}.mlp.experts.{e}.up_proj.weight"] = (
+                    torch.randn(intermediate_dim, hidden_dim, dtype=torch.bfloat16)
+                )
+                weights[f"model.layers.{l}.mlp.experts.{e}.down_proj.weight"] = (
+                    torch.randn(hidden_dim, intermediate_dim, dtype=torch.bfloat16)
+                )
+                # 2D block scales
+                weights[
+                    f"model.layers.{l}.mlp.experts.{e}.gate_proj.weight_scale"
+                ] = torch.randn(intermediate_dim // 32, hidden_dim // 32, dtype=torch.float32)
+                weights[
+                    f"model.layers.{l}.mlp.experts.{e}.up_proj.weight_scale"
+                ] = torch.randn(intermediate_dim // 32, hidden_dim // 32, dtype=torch.float32)
+                weights[
+                    f"model.layers.{l}.mlp.experts.{e}.down_proj.weight_scale"
+                ] = torch.randn(hidden_dim // 32, intermediate_dim // 32, dtype=torch.float32)
+
+        shard_path = os.path.join(tmpdir, "model.safetensors")
+        save_file(weights, shard_path)
+
+        yield shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim
+
+
+def test_safetensors_moe_index_parsing(synthetic_moe_checkpoint):
+    """Verifies that SafetensorsMoEIndex correctly parses and classifies all keys."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    index = SafetensorsMoEIndex.build([shard_path])
+
+    # Check non-MoE keys count
+    # 2 global (embed, norm) + 2 layer norms = 4 non-MoE keys
+    assert len(index.non_moe_keys) == 4
+    non_moe_names = {k for k, _ in index.non_moe_keys}
+    assert "model.embed_tokens.weight" in non_moe_names
+    assert "model.norm.weight" in non_moe_names
+
+    # Check MoE layers count
+    assert len(index.moe_layers) == num_layers
+    for l in range(num_layers):
+        prefix = f"model.layers.{l}.mlp.experts"
+        assert prefix in index.moe_layers
+        plan = index.moe_layers[prefix]
+        assert plan.num_total_experts == num_experts
+
+        # Check projections
+        assert ("gate", ".weight") in plan.slices
+        assert ("up", ".weight") in plan.slices
+        assert ("down", ".weight") in plan.slices
+        assert ("gate", ".weight_scale") in plan.slices
+        assert ("up", ".weight_scale") in plan.slices
+        assert ("down", ".weight_scale") in plan.slices
+
+        assert len(plan.slices[("gate", ".weight")]) == num_experts
+        assert len(plan.slices[("up", ".weight")]) == num_experts
+        assert len(plan.slices[("down", ".weight")]) == num_experts
+
+
+def test_fast_bypass_iterator_numerical_equivalence(synthetic_moe_checkpoint):
+    """Verifies exact bitwise equivalence between fast bypass 3D tensors and 2D source slices."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator([shard_path]):
+        loaded_tensors[name] = tensor.clone()
+
+    # Total yielded keys:
+    # 4 non-MoE keys + (4 consolidated keys * 2 layers) = 12 keys
+    # vs original (4 + 6 * 8 * 2) = 100 keys!
+    assert len(loaded_tensors) == 12
+
+    for l in range(num_layers):
+        prefix = f"model.layers.{l}.mlp.experts"
+        gate_up_name = f"{prefix}.gate_up_proj"
+        down_name = f"{prefix}.down_proj"
+        gate_up_scale_name = f"{prefix}.gate_up_proj.weight_scale"
+        down_scale_name = f"{prefix}.down_proj.weight_scale"
+
+        assert gate_up_name in loaded_tensors
+        assert down_name in loaded_tensors
+        assert gate_up_scale_name in loaded_tensors
+        assert down_scale_name in loaded_tensors
+
+        fused_gate_up = loaded_tensors[gate_up_name]
+        fused_down = loaded_tensors[down_name]
+        fused_gate_up_scale = loaded_tensors[gate_up_scale_name]
+        fused_down_scale = loaded_tensors[down_scale_name]
+
+        assert fused_gate_up.shape == (num_experts, 2 * intermediate_dim, hidden_dim)
+        assert fused_down.shape == (num_experts, hidden_dim, intermediate_dim)
+
+        # Bitwise verification for each expert
+        for e in range(num_experts):
+            expected_gate = weights[f"{prefix}.{e}.gate_proj.weight"]
+            expected_up = weights[f"{prefix}.{e}.up_proj.weight"]
+            expected_down = weights[f"{prefix}.{e}.down_proj.weight"]
+
+            expected_gate_scale = weights[f"{prefix}.{e}.gate_proj.weight_scale"]
+            expected_up_scale = weights[f"{prefix}.{e}.up_proj.weight_scale"]
+            expected_down_scale = weights[f"{prefix}.{e}.down_proj.weight_scale"]
+
+            # Gate in lower half, up in upper half
+            actual_gate = fused_gate_up[e, :intermediate_dim, :]
+            actual_up = fused_gate_up[e, intermediate_dim:, :]
+            actual_down = fused_down[e]
+
+            assert torch.equal(actual_gate, expected_gate), f"Layer {l} Expert {e} gate mismatch"
+            assert torch.equal(actual_up, expected_up), f"Layer {l} Expert {e} up mismatch"
+            assert torch.equal(actual_down, expected_down), f"Layer {l} Expert {e} down mismatch"
+
+            # Scales
+            scale_gate_dim = intermediate_dim // 32
+            actual_gate_scale = fused_gate_up_scale[e, :scale_gate_dim, :]
+            actual_up_scale = fused_gate_up_scale[e, scale_gate_dim:, :]
+            actual_down_scale = fused_down_scale[e]
+
+            assert torch.equal(actual_gate_scale, expected_gate_scale)
+            assert torch.equal(actual_up_scale, expected_up_scale)
+            assert torch.equal(actual_down_scale, expected_down_scale)
+
+
+def test_fast_bypass_iterator_expert_parallelism(synthetic_moe_checkpoint):
+    """Verifies that under Expert Parallelism, only local experts are buffered and yielded."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    # Rank 0 handles experts {0, 1, 2, 3}
+    local_eids = {0, 1, 2, 3}
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator(
+        [shard_path], local_expert_ids=local_eids
+    ):
+        loaded_tensors[name] = tensor.clone()
+
+    for l in range(num_layers):
+        prefix = f"model.layers.{l}.mlp.experts"
+        fused_gate_up = loaded_tensors[f"{prefix}.gate_up_proj"]
+        fused_down = loaded_tensors[f"{prefix}.down_proj"]
+
+        # Only 4 local experts
+        assert fused_gate_up.shape == (len(local_eids), 2 * intermediate_dim, hidden_dim)
+        assert fused_down.shape == (len(local_eids), hidden_dim, intermediate_dim)
+
+        for slot_idx, e in enumerate(sorted(local_eids)):
+            expected_gate = weights[f"{prefix}.{e}.gate_proj.weight"]
+            expected_up = weights[f"{prefix}.{e}.up_proj.weight"]
+            expected_down = weights[f"{prefix}.{e}.down_proj.weight"]
+
+            actual_gate = fused_gate_up[slot_idx, :intermediate_dim, :]
+            actual_up = fused_gate_up[slot_idx, intermediate_dim:, :]
+            actual_down = fused_down[slot_idx]
+
+            assert torch.equal(actual_gate, expected_gate)
+            assert torch.equal(actual_up, expected_up)
+            assert torch.equal(actual_down, expected_down)
+
+
+def _create_simple_routed_experts(num_experts, hidden_dim, intermediate_dim):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    moe_config = FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=1,
+        hidden_dim=hidden_dim,
+        intermediate_size=intermediate_dim,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU,
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        routing_method=RoutingMethodType.TopK,
+        max_num_tokens=4096,
+    )
+    moe_config.moe_parallel_config = FusedMoEParallelConfig.make_no_parallel()
+    moe_config.is_fused_checkpoint_transposed = False
+    moe_config.enable_expert_parallel = False
+    moe_config.expert_placement_strategy = "linear"
+
+    experts = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(experts)
+    experts.layer_name = "experts"
+    experts.moe_config = moe_config
+    experts.global_num_experts = num_experts
+    experts.hidden_size = hidden_dim
+    experts.is_fused_checkpoint_transposed = False
+    experts.lora_base_layer_prefix = ""
+    experts.ckpt_gate_proj_name = "gate_proj"
+    experts.ckpt_down_proj_name = "down_proj"
+    experts.ckpt_up_proj_name = "up_proj"
+    experts.quant_config = None
+
+    class DummyMapManager:
+        num_fused_shared_experts = 0
+        def map_global_to_local(self, expert_id: int) -> int:
+            return expert_id
+
+    experts.expert_map_manager = DummyMapManager()
+    with set_current_vllm_config(VllmConfig()):
+        experts.quant_method = UnquantizedFusedMoEMethod(moe_config)
+
+    experts.w13_weight = torch.nn.Parameter(
+        torch.zeros(num_experts, 2 * intermediate_dim, hidden_dim, device="cpu", dtype=torch.bfloat16)
+    )
+    experts.w2_weight = torch.nn.Parameter(
+        torch.zeros(num_experts, hidden_dim, intermediate_dim, device="cpu", dtype=torch.bfloat16)
+    )
+    experts.w13_weight.weight_loader = experts.weight_loader
+    experts.w2_weight.weight_loader = experts.weight_loader
+    return experts
+
+
+def test_routed_experts_integration_with_fast_bypass(synthetic_moe_checkpoint):
+    """Verifies that RoutedExperts.load_weights successfully bulk-loads fast bypass 3D tensors."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    layer = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+    weights_stream = [
+        (name, tensor)
+        for name, tensor in fast_bypass_safetensors_iterator([shard_path])
+        if name.startswith(prefix)
+    ]
+
+    # Map the yielded keys (experts.gate_up_proj -> experts.w13, experts.down_proj -> experts.w2)
+    # as done by RoutedExperts expert_params_mapping
+    mapped_stream = []
+    for name, tensor in weights_stream:
+        # Strip model.layers.0.mlp.experts. prefix so it matches layer relative name
+        rel_name = name[len(f"{prefix}.") :]
+        mapped_stream.append((rel_name, tensor))
+
+    # RoutedExperts.load_weights is a generator; exhaust it to execute loading
+    list(layer.load_weights(mapped_stream))
+
+    # Verify layer weights match expected bitwise
+    for e in range(num_experts):
+        expected_gate = weights[f"{prefix}.{e}.gate_proj.weight"]
+        expected_up = weights[f"{prefix}.{e}.up_proj.weight"]
+        expected_down = weights[f"{prefix}.{e}.down_proj.weight"]
+
+        actual_gate = layer.w13_weight[e, :intermediate_dim, :]
+        actual_up = layer.w13_weight[e, intermediate_dim:, :]
+        actual_down = layer.w2_weight[e]
+
+        assert torch.equal(actual_gate, expected_gate)
+        assert torch.equal(actual_up, expected_up)
+        assert torch.equal(actual_down, expected_down)
+
+
+@pytest.fixture
+def synthetic_3d_moe_checkpoint():
+    """Creates a temporary safetensors checkpoint with 3D pre-fused MoE weights and negative cases."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        num_experts = 8
+        hidden_dim = 64
+        intermediate_dim = 128
+
+        weights = {}
+
+        # Non-MoE weights
+        weights["model.embed_tokens.weight"] = torch.randn(
+            100, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.norm.weight"] = torch.ones(hidden_dim, dtype=torch.bfloat16)
+
+        # Negative edge cases that must NOT be parsed as MoE
+        weights["model.vision_tower.patch_embedding.weight"] = torch.randn(
+            16, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.shared_experts.gate_up_proj.weight"] = torch.randn(
+            2 * intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.experts.bias"] = torch.zeros(
+            hidden_dim, dtype=torch.bfloat16
+        )
+
+        # Layer 0: Pre-fused 3D weights and scales
+        weights["model.layers.0.input_layernorm.weight"] = torch.ones(
+            hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.experts.gate_up_proj"] = torch.randn(
+            num_experts, 2 * intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.experts.down_proj"] = torch.randn(
+            num_experts, hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.experts.gate_up_proj.weight_scale"] = torch.randn(
+            num_experts, (2 * intermediate_dim) // 32, hidden_dim // 32, dtype=torch.float32
+        )
+        weights["model.layers.0.mlp.experts.down_proj.weight_scale"] = torch.randn(
+            num_experts, hidden_dim // 32, intermediate_dim // 32, dtype=torch.float32
+        )
+
+        # Layer 1: Separate 3D gate and up weights (DeepSeek-V3 style) + scales
+        weights["model.layers.1.input_layernorm.weight"] = torch.ones(
+            hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.1.mlp.experts.gate_proj.weight"] = torch.randn(
+            num_experts, intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.1.mlp.experts.up_proj.weight"] = torch.randn(
+            num_experts, intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.1.mlp.experts.down_proj.weight"] = torch.randn(
+            num_experts, hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.1.mlp.experts.gate_proj.weight_scale"] = torch.randn(
+            num_experts, intermediate_dim // 32, hidden_dim // 32, dtype=torch.float32
+        )
+        weights["model.layers.1.mlp.experts.up_proj.weight_scale"] = torch.randn(
+            num_experts, intermediate_dim // 32, hidden_dim // 32, dtype=torch.float32
+        )
+        weights["model.layers.1.mlp.experts.down_proj.weight_scale"] = torch.randn(
+            num_experts, hidden_dim // 32, intermediate_dim // 32, dtype=torch.float32
+        )
+
+        shard_path = os.path.join(tmpdir, "model_3d.safetensors")
+        save_file(weights, shard_path)
+
+        yield shard_path, weights, num_experts, hidden_dim, intermediate_dim
+
+
+def test_3d_safetensors_index_parsing(synthetic_3d_moe_checkpoint):
+    """Verifies that SafetensorsMoEIndex correctly parses 3D MoE keys and rejects non-MoE weights."""
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    index = SafetensorsMoEIndex.build([shard_path])
+
+    # Check non-MoE keys:
+    # embed, norm, vision patch embedding, shared_experts, experts.bias, layer 0 norm, layer 1 norm = 7 keys
+    non_moe_names = {k for k, _ in index.non_moe_keys}
+    assert "model.vision_tower.patch_embedding.weight" in non_moe_names
+    assert "model.layers.0.mlp.shared_experts.gate_up_proj.weight" in non_moe_names
+    assert "model.layers.0.mlp.experts.bias" in non_moe_names
+    assert "model.embed_tokens.weight" in non_moe_names
+
+    # Check MoE layers count
+    assert len(index.moe_layers) == 2
+
+    # Layer 0 has pre-fused gate_up and down
+    plan0 = index.moe_layers["model.layers.0.mlp.experts"]
+    assert plan0.num_total_experts == num_experts
+    assert ("gate_up", "") in plan0.tensors_3d
+    assert ("down", "") in plan0.tensors_3d
+    assert ("gate_up", ".weight_scale") in plan0.tensors_3d
+    assert ("down", ".weight_scale") in plan0.tensors_3d
+
+    # Layer 1 has separate gate, up, down
+    plan1 = index.moe_layers["model.layers.1.mlp.experts"]
+    assert plan1.num_total_experts == num_experts
+    assert ("gate", ".weight") in plan1.tensors_3d
+    assert ("up", ".weight") in plan1.tensors_3d
+    assert ("down", ".weight") in plan1.tensors_3d
+    assert ("gate", ".weight_scale") in plan1.tensors_3d
+    assert ("up", ".weight_scale") in plan1.tensors_3d
+    assert ("down", ".weight_scale") in plan1.tensors_3d
+
+
+def test_3d_fast_bypass_iterator_numerical_equivalence(synthetic_3d_moe_checkpoint):
+    """Verifies bitwise numerical equivalence for pre-fused 3D tensors and online 3D gate+up fusion."""
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator([shard_path]):
+        loaded_tensors[name] = tensor.clone()
+
+    # Layer 0: pre-fused
+    prefix0 = "model.layers.0.mlp.experts"
+    assert torch.equal(
+        loaded_tensors[f"{prefix0}.gate_up_proj"],
+        weights[f"{prefix0}.gate_up_proj"],
+    )
+    assert torch.equal(
+        loaded_tensors[f"{prefix0}.down_proj"],
+        weights[f"{prefix0}.down_proj"],
+    )
+    assert torch.equal(
+        loaded_tensors[f"{prefix0}.gate_up_proj.weight_scale"],
+        weights[f"{prefix0}.gate_up_proj.weight_scale"],
+    )
+    assert torch.equal(
+        loaded_tensors[f"{prefix0}.down_proj.weight_scale"],
+        weights[f"{prefix0}.down_proj.weight_scale"],
+    )
+
+    # Layer 1: fused online from separate gate_proj and up_proj
+    prefix1 = "model.layers.1.mlp.experts"
+    fused_gate_up = loaded_tensors[f"{prefix1}.gate_up_proj"]
+    fused_gate_up_scale = loaded_tensors[f"{prefix1}.gate_up_proj.weight_scale"]
+
+    expected_gate = weights[f"{prefix1}.gate_proj.weight"]
+    expected_up = weights[f"{prefix1}.up_proj.weight"]
+    assert torch.equal(fused_gate_up[:, :intermediate_dim, :], expected_gate)
+    assert torch.equal(fused_gate_up[:, intermediate_dim:, :], expected_up)
+
+    expected_gate_scale = weights[f"{prefix1}.gate_proj.weight_scale"]
+    expected_up_scale = weights[f"{prefix1}.up_proj.weight_scale"]
+    scale_gate_dim = intermediate_dim // 32
+    assert torch.equal(fused_gate_up_scale[:, :scale_gate_dim, :], expected_gate_scale)
+    assert torch.equal(fused_gate_up_scale[:, scale_gate_dim:, :], expected_up_scale)
+
+    assert torch.equal(
+        loaded_tensors[f"{prefix1}.down_proj"],
+        weights[f"{prefix1}.down_proj.weight"],
+    )
+
+
+@pytest.mark.parametrize("local_eids", [{0, 1, 2, 3}, {4, 5, 6, 7}])
+def test_3d_fast_bypass_iterator_linear_ep(synthetic_3d_moe_checkpoint, local_eids):
+    """Verifies that under Linear EP, 3D tensors are sliced to local experts with zero extra bytes."""
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator(
+        [shard_path], local_expert_ids=local_eids
+    ):
+        loaded_tensors[name] = tensor.clone()
+
+    start_eid = min(local_eids)
+    end_eid = max(local_eids) + 1
+
+    # Layer 0 verification
+    prefix0 = "model.layers.0.mlp.experts"
+    l0_gate_up = loaded_tensors[f"{prefix0}.gate_up_proj"]
+    assert l0_gate_up.shape == (len(local_eids), 2 * intermediate_dim, hidden_dim)
+    assert torch.equal(
+        l0_gate_up,
+        weights[f"{prefix0}.gate_up_proj"][start_eid:end_eid],
+    )
+
+    # Layer 1 verification (online fused gate+up)
+    prefix1 = "model.layers.1.mlp.experts"
+    l1_gate_up = loaded_tensors[f"{prefix1}.gate_up_proj"]
+    assert l1_gate_up.shape == (len(local_eids), 2 * intermediate_dim, hidden_dim)
+    expected_l1_gate = weights[f"{prefix1}.gate_proj.weight"][start_eid:end_eid]
+    expected_l1_up = weights[f"{prefix1}.up_proj.weight"][start_eid:end_eid]
+    assert torch.equal(l1_gate_up[:, :intermediate_dim, :], expected_l1_gate)
+    assert torch.equal(l1_gate_up[:, intermediate_dim:, :], expected_l1_up)
+
+
+def test_3d_fast_bypass_iterator_non_contiguous_ep(synthetic_3d_moe_checkpoint):
+    """Verifies that arbitrary non-contiguous EP (e.g. round-robin {0, 2, 4, 6}) slices correctly."""
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    local_eids = {0, 2, 4, 6}
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator(
+        [shard_path], local_expert_ids=local_eids
+    ):
+        loaded_tensors[name] = tensor.clone()
+
+    prefix0 = "model.layers.0.mlp.experts"
+    l0_gate_up = loaded_tensors[f"{prefix0}.gate_up_proj"]
+    assert l0_gate_up.shape == (4, 2 * intermediate_dim, hidden_dim)
+
+    for slot_idx, eid in enumerate(sorted(local_eids)):
+        expected_expert = weights[f"{prefix0}.gate_up_proj"][eid]
+        assert torch.equal(l0_gate_up[slot_idx], expected_expert)
+
+
+def test_routed_experts_integration_with_3d_fast_bypass(synthetic_3d_moe_checkpoint):
+    """Verifies that RoutedExperts.load_weights successfully ingests pre-fused 3D tensors."""
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    layer = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+    weights_stream = [
+        (name, tensor)
+        for name, tensor in fast_bypass_safetensors_iterator([shard_path])
+        if name.startswith(prefix)
+    ]
+
+    mapped_stream = []
+    for name, tensor in weights_stream:
+        rel_name = name[len(f"{prefix}.") :]
+        mapped_stream.append((rel_name, tensor))
+
+    list(layer.load_weights(mapped_stream))
+
+    assert torch.equal(layer.w13_weight, weights[f"{prefix}.gate_up_proj"])
+    assert torch.equal(layer.w2_weight, weights[f"{prefix}.down_proj"])
+
+
+def test_hand_rolled_moe_load_weights_compatibility(synthetic_3d_moe_checkpoint):
+    """Verifies that hand-rolled model load_weights loops (like Glm5NextModel and KimiK3)
+
+    cleanly load consolidated 3D weights without KeyError or dropped parameters.
+    """
+    from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+
+    shard_path, weights, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_3d_moe_checkpoint
+    )
+
+    layer = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].mlp = torch.nn.Module()
+            self.model.layers[0].mlp.experts = torch.nn.Module()
+            self.model.layers[0].mlp.experts.routed_experts = routed_experts
+
+    dummy_model = DummyModel(layer)
+    params_dict = dict(dummy_model.named_parameters())
+
+    # Test Case 1: GLM / DeepSeek naming (gate_proj, down_proj, up_proj)
+    expert_mapping_glm = fused_moe_make_expert_params_mapping(
+        dummy_model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=num_experts,
+    )
+
+    weights_stream = list(fast_bypass_safetensors_iterator([shard_path]))
+    for name, loaded_weight in weights_stream:
+        if not ("layers.0.mlp.experts" in name and ("gate_up_proj" in name or "down_proj" in name)):
+            continue
+        if "scale" in name:
+            continue
+        for param_name, weight_name, expert_id, expert_shard_id in expert_mapping_glm:
+            if weight_name not in name:
+                continue
+            name_mapped = name.replace(weight_name, param_name)
+            if name_mapped not in params_dict:
+                continue
+            param = params_dict[name_mapped]
+            weight_loader = getattr(param, "weight_loader", layer.weight_loader)
+            success = weight_loader(
+                param,
+                loaded_weight,
+                name_mapped,
+                expert_id=expert_id,
+                shard_id=expert_shard_id,
+                return_success=True,
+            )
+            if success:
+                break
+        else:
+            raise KeyError(f"Key {name} failed to match expert_mapping")
+
+    prefix0 = "model.layers.0.mlp.experts"
+    assert torch.equal(layer.w13_weight, weights[f"{prefix0}.gate_up_proj"])
+    assert torch.equal(layer.w2_weight, weights[f"{prefix0}.down_proj"])
+
+    # Test Case 2: Kimi-K3 naming (w1, w2, w3)
+    layer.w13_weight.data.zero_()
+    layer.w2_weight.data.zero_()
+    expert_mapping_kimi = fused_moe_make_expert_params_mapping(
+        dummy_model,
+        ckpt_gate_proj_name="w1",
+        ckpt_down_proj_name="w2",
+        ckpt_up_proj_name="w3",
+        num_experts=num_experts,
+    )
+
+    for name, loaded_weight in weights_stream:
+        if not ("layers.0.mlp.experts" in name and ("gate_up_proj" in name or "down_proj" in name)):
+            continue
+        if "scale" in name:
+            continue
+        for param_name, weight_name, expert_id, expert_shard_id in expert_mapping_kimi:
+            if weight_name not in name:
+                continue
+            name_mapped = name.replace(weight_name, param_name)
+            if name_mapped not in params_dict:
+                continue
+            param = params_dict[name_mapped]
+            weight_loader = getattr(param, "weight_loader", layer.weight_loader)
+            success = weight_loader(
+                param,
+                loaded_weight,
+                name_mapped,
+                expert_id=expert_id,
+                shard_id=expert_shard_id,
+                return_success=True,
+            )
+            if success:
+                break
+        else:
+            raise KeyError(f"Key {name} failed to match expert_mapping")
+
+    assert torch.equal(layer.w13_weight, weights[f"{prefix0}.gate_up_proj"])
+    assert torch.equal(layer.w2_weight, weights[f"{prefix0}.down_proj"])
+
+
+def test_mode2_direct_vram_streaming(synthetic_moe_checkpoint):
+    """Verifies that Mode 2 (direct_vram_mode=True) streams all keys with pipelined prefetching."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    loaded_tensors = {}
+    for name, tensor in fast_bypass_safetensors_iterator(
+        [shard_path], direct_vram_mode=True
+    ):
+        loaded_tensors[name] = tensor.clone()
+
+    # All non-MoE and MoE 2D keys must be yielded directly
+    for k, v in weights.items():
+        assert k in loaded_tensors, f"Key {k} missing in Mode 2 stream"
+        assert torch.equal(loaded_tensors[k], v), f"Tensor mismatch for key {k}"
+
+
+def test_mode1_vs_mode2_numerical_parity(synthetic_moe_checkpoint):
+    """Verifies exact bitwise parity of loaded layer weights between Mode 1 and Mode 2."""
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+
+    # 1. Ingest via Mode 1 (3D host staging)
+    layer_mode1 = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+    stream_mode1 = [
+        (name[len(f"{prefix}.") :], tensor)
+        for name, tensor in fast_bypass_safetensors_iterator(
+            [shard_path], direct_vram_mode=False
+        )
+        if name.startswith(prefix)
+    ]
+    list(layer_mode1.load_weights(stream_mode1))
+
+    # 2. Ingest via Mode 2 (Direct-to-VRAM streaming)
+    layer_mode2 = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+    stream_mode2 = [
+        (name[len(f"{prefix}.") :], tensor)
+        for name, tensor in fast_bypass_safetensors_iterator(
+            [shard_path], direct_vram_mode=True
+        )
+        if name.startswith(prefix)
+    ]
+    list(layer_mode2.load_weights(stream_mode2))
+
+    # Bitwise parity assertion
+    assert torch.equal(layer_mode1.w13_weight, layer_mode2.w13_weight)
+    assert torch.equal(layer_mode1.w2_weight, layer_mode2.w2_weight)
+
+
+def test_mode2_fse_shared_expert_routing():
+    """Verifies that Mode 2 routes FSE shared experts into virtual expert slot num_routed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        num_routed = 8
+        hidden_dim = 64
+        intermediate_dim = 128
+
+        weights = {}
+        # Routed experts
+        for e in range(num_routed):
+            weights[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            )
+            weights[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+                intermediate_dim, hidden_dim, dtype=torch.bfloat16
+            )
+            weights[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+                hidden_dim, intermediate_dim, dtype=torch.bfloat16
+            )
+        # Shared expert
+        weights["model.layers.0.mlp.shared_experts.gate_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.shared_experts.up_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        weights["model.layers.0.mlp.shared_experts.down_proj.weight"] = torch.randn(
+            hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+
+        shard_path = os.path.join(tmpdir, "fse_model.safetensors")
+        save_file(weights, shard_path)
+
+        stream = list(
+            fast_bypass_safetensors_iterator(
+                [shard_path],
+                direct_vram_mode=True,
+                fse_enabled=True,
+                n_shared_experts=1,
+            )
+        )
+        yielded_keys = {name: tensor for name, tensor in stream}
+
+        # Shared expert must be remapped to virtual slot num_routed (8)
+        assert "model.layers.0.mlp.experts.8.gate_proj.weight" in yielded_keys
+        assert "model.layers.0.mlp.experts.8.up_proj.weight" in yielded_keys
+        assert "model.layers.0.mlp.experts.8.down_proj.weight" in yielded_keys
+
+        assert torch.equal(
+            yielded_keys["model.layers.0.mlp.experts.8.gate_proj.weight"],
+            weights["model.layers.0.mlp.shared_experts.gate_proj.weight"],
+        )
+        assert torch.equal(
+            yielded_keys["model.layers.0.mlp.experts.8.down_proj.weight"],
+            weights["model.layers.0.mlp.shared_experts.down_proj.weight"],
+        )
+
+
+def test_kimi_k3_load_weights_o1_fast_path(synthetic_moe_checkpoint):
+    """Verifies that the O(1) indexed expert mapping in Kimi-K3 linear loader correctly loads weights."""
+    from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+
+    layer = _create_simple_routed_experts(
+        num_experts=num_experts,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+    )
+
+    class DummyKimiModel(torch.nn.Module):
+        def __init__(self, routed_experts):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].mlp = torch.nn.Module()
+            self.model.layers[0].mlp.experts = torch.nn.Module()
+            self.model.layers[0].mlp.experts.routed_experts = routed_experts
+
+    dummy_model = DummyKimiModel(layer)
+    params_dict = dict(dummy_model.named_parameters())
+
+    expert_params_mapping = fused_moe_make_expert_params_mapping(
+        dummy_model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=num_experts,
+    )
+
+    import re
+    expert_2d_dict = {}
+    expert_fused_list = []
+    _EXPERT_SUB_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
+    for item in expert_params_mapping:
+        param_name, weight_name, expert_id, shard_id = item
+        m = _EXPERT_SUB_RE.search(weight_name)
+        if m is not None:
+            eid = int(m.group(1))
+            proj = m.group(2)
+            expert_2d_dict[(eid, proj)] = item
+        else:
+            expert_fused_list.append(item)
+
+    # Ingest weights through the O(1) mapping
+    stream = list(fast_bypass_safetensors_iterator([shard_path], direct_vram_mode=True))
+    for name, loaded_weight in stream:
+        if "experts." not in name or "scale" in name or not name.startswith("model.layers.0.mlp.experts"):
+            continue
+        m = _EXPERT_SUB_RE.search(name)
+        assert m is not None, f"Key {name} failed regex search"
+        eid = int(m.group(1))
+        proj = m.group(2)
+        item = expert_2d_dict.get((eid, proj))
+        assert item is not None, f"Key {name} missing in expert_2d_dict"
+        expert_param_name, expert_weight_name, expert_id, expert_shard_id = item
+        name_mapped = name.replace(expert_weight_name, expert_param_name)
+        param = params_dict[name_mapped]
+        weight_loader = getattr(param, "weight_loader", layer.weight_loader)
+        weight_loader(
+            param,
+            loaded_weight,
+            name_mapped,
+            expert_id=expert_id,
+            shard_id=expert_shard_id,
+        )
+
+    prefix0 = "model.layers.0.mlp.experts"
+    for e in range(num_experts):
+        expected_gate = weights[f"{prefix0}.{e}.gate_proj.weight"]
+        expected_up = weights[f"{prefix0}.{e}.up_proj.weight"]
+        expected_down = weights[f"{prefix0}.{e}.down_proj.weight"]
+
+        assert torch.equal(layer.w13_weight[e, :intermediate_dim, :], expected_gate)
+        assert torch.equal(layer.w13_weight[e, intermediate_dim:, :], expected_up)
+        assert torch.equal(layer.w2_weight[e], expected_down)
+
+
+

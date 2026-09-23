@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    fast_bypass_safetensors_iterator,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -275,12 +276,48 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                 )
             else:
-                if extra_config.get("enable_multithread_load"):
+                if extra_config.get("enable_fast_moe_bypass") or os.environ.get("VLLM_FAST_MOE_BYPASS", "0") in ("1", "true", "True"):
+                    n_shared_experts = 1
+                    if getattr(self, "model_config", None):
+                        hf_cfg = getattr(self.model_config, "hf_config", None)
+                        if hf_cfg:
+                            n_shared_experts = (
+                                getattr(hf_cfg, "n_shared_experts", None)
+                                or getattr(hf_cfg, "num_shared_experts", None)
+                                or 1
+                            )
+                    fse_enabled = extra_config.get("fuse_shared_experts")
+                    if fse_enabled is None:
+                        fse_enabled = os.environ.get(
+                            "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "0"
+                        ).lower() in ("1", "true")
+                    weights_iterator = fast_bypass_safetensors_iterator(
+                        hf_weights_files,
+                        local_expert_ids=self.local_expert_ids,
+                        max_workers=extra_config.get(
+                            "num_threads", self.DEFAULT_NUM_THREADS
+                        ),
+                        fse_enabled=fse_enabled,
+                        n_shared_experts=n_shared_experts,
+                        direct_vram_mode=extra_config.get("direct_vram_mode"),
+                        direct_vram_threshold_gb=extra_config.get(
+                            "direct_vram_threshold_gb", 100.0
+                        ),
+                        drop_cache_after_load=extra_config.get(
+                            "drop_cache_after_load",
+                            os.environ.get("VLLM_MOE_DROP_CACHE", "0") in ("1", "true")
+                        ),
+                    )
+                elif extra_config.get("enable_multithread_load"):
                     weights_iterator = multi_thread_safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
+                        ),
+                        local_expert_ids=self.local_expert_ids,
+                        drop_cache_after_load=extra_config.get(
+                            "drop_cache_after_load", True
                         ),
                     )
                 else:

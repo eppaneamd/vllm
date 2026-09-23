@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
+import inspect
+import re
 from typing import Any
 
 import torch
@@ -456,8 +458,13 @@ class KimiMLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        out = self.mla_attn(positions, hidden_states)
+        if output is not None:
+            output[:] = out
+            return None
+        return out
 
 
 class KimiDecoderLayer(nn.Module):
@@ -581,6 +588,18 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(self, "_self_attn_has_output", None) is None:
+            self._self_attn_has_output = (
+                "output" in inspect.signature(self.self_attn.forward).parameters
+            )
+        if self._self_attn_has_output:
+            attn_output = torch.empty_like(hidden_states)
+            self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                output=attn_output,
+            )
+            return attn_output
         return self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -900,6 +919,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             )
         else:
             expert_params_mapping = []
+
+        # Pre-index expert_params_mapping to eliminate O(N_keys * N_experts) string scan
+        expert_2d_dict: dict[tuple[int, str], tuple[str, str, int, str]] = {}
+        expert_fused_list: list[tuple[str, str, int, str]] = []
+        _EXPERT_SUB_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
+        for item in expert_params_mapping:
+            param_name, weight_name, expert_id, shard_id = item
+            m = _EXPERT_SUB_RE.search(weight_name)
+            if m is not None:
+                eid = int(m.group(1))
+                proj = m.group(2)
+                expert_2d_dict[(eid, proj)] = item
+            else:
+                expert_fused_list.append(item)
+
         params_dict = dict(self.named_parameters())
         # Under the MXFP4 quant interface the routed experts register unpacked
         # params (``w13_weight``), while the compressed-tensors checkpoint names
@@ -948,28 +982,53 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for (
-                    expert_param_name,
-                    expert_weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if expert_weight_name not in name:
-                        continue
-                    name = name.replace(expert_weight_name, expert_param_name)
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        expert_id=expert_id,
-                        shard_id=expert_shard_id,
-                    )
-                    break
-                else:
+                matched_expert = False
+                if "experts." in name:
+                    m = _EXPERT_SUB_RE.search(name)
+                    if m is not None:
+                        eid = int(m.group(1))
+                        proj = m.group(2)
+                        item = expert_2d_dict.get((eid, proj))
+                        if item is not None:
+                            expert_param_name, expert_weight_name, expert_id, expert_shard_id = item
+                            name_mapped = name.replace(expert_weight_name, expert_param_name)
+                            if not is_pp_missing_parameter(name_mapped, self):
+                                name = name_mapped
+                                param = params_dict[name]
+                                weight_loader = param.weight_loader
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name,
+                                    expert_id=expert_id,
+                                    shard_id=expert_shard_id,
+                                )
+                                matched_expert = True
+                    if not matched_expert and expert_fused_list:
+                        for (
+                            expert_param_name,
+                            expert_weight_name,
+                            expert_id,
+                            expert_shard_id,
+                        ) in expert_fused_list:
+                            if expert_weight_name not in name:
+                                continue
+                            name_mapped = name.replace(expert_weight_name, expert_param_name)
+                            if is_pp_missing_parameter(name_mapped, self):
+                                continue
+                            name = name_mapped
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name,
+                                expert_id=expert_id,
+                                shard_id=expert_shard_id,
+                            )
+                            matched_expert = True
+                            break
+                if not matched_expert:
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
