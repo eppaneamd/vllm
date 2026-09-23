@@ -33,6 +33,41 @@ from .shared_pinned_pool import (
 
 logger = logging.getLogger(__name__)
 
+# Standard mapping from safetensors dtype string to torch.dtype
+_SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+for _k, _attr in [
+    ("F8_E4M3", "float8_e4m3fn"),
+    ("F8_E4M3FNUZ", "float8_e4m3fnuz"),
+    ("F8_E5M2", "float8_e5m2"),
+    ("F8_E5M2FNUZ", "float8_e5m2fnuz"),
+    ("C64", "complex64"),
+    ("U64", "uint64"),
+    ("U32", "uint32"),
+    ("U16", "uint16"),
+]:
+    _t = getattr(torch, _attr, None)
+    if _t is not None:
+        _SAFETENSORS_DTYPE_MAP[_k] = _t
+
+try:
+    import safetensors.torch
+    if hasattr(safetensors.torch, "_TYPES"):
+        _SAFETENSORS_DTYPE_MAP.update(safetensors.torch._TYPES)
+except ImportError:
+    pass
+
 # Regex matching standard MoE expert slice keys across model families:
 # e.g.:
 # model.layers.0.mlp.experts.42.gate_proj.weight
@@ -213,18 +248,6 @@ class SafetensorsMoEIndex:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             headers = list(executor.map(read_header, self.hf_weights_files))
 
-        dtype_map = {
-            "BF16": torch.bfloat16,
-            "F16": torch.float16,
-            "F32": torch.float32,
-            "U8": torch.uint8,
-            "I8": torch.int8,
-            "I16": torch.int16,
-            "I32": torch.int32,
-            "I64": torch.int64,
-            "BOOL": torch.bool,
-        }
-
         for shard_file, header_size, header in headers:
             self.shard_headers[shard_file] = (header_size, header)
             for key, meta in header.items():
@@ -266,7 +289,7 @@ class SafetensorsMoEIndex:
 
                     shape = tuple(meta.get("shape", ()))
                     dtype_str = meta.get("dtype", "BF16")
-                    dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
 
                     slice_loc = MoESliceLocation(
                         shard_file=shard_file,
@@ -308,7 +331,7 @@ class SafetensorsMoEIndex:
                     prefix = m_3d.group("prefix")
                     suffix = m_3d.group("suffix") or ""
                     dtype_str = meta.get("dtype", "BF16")
-                    dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
 
                     if proj in _GATE_NAMES:
                         proj_cat = "gate"
@@ -366,7 +389,7 @@ class SafetensorsMoEIndex:
 
                     shape = tuple(meta.get("shape", ()))
                     dtype_str = meta.get("dtype", "BF16")
-                    dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                    dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
 
                     slice_loc = MoESliceLocation(
                         shard_file=shard_file,
@@ -742,18 +765,6 @@ def _stream_direct_io_broadcast(
     reader = DirectBlockFileReader(max_workers=max_workers) if is_reader else None
     reader_executor = ThreadPoolExecutor(max_workers=1) if is_reader else None
 
-    dtype_map = {
-        "BF16": torch.bfloat16,
-        "F16": torch.float16,
-        "F32": torch.float32,
-        "U8": torch.uint8,
-        "I8": torch.int8,
-        "I16": torch.int16,
-        "I32": torch.int32,
-        "I64": torch.int64,
-        "BOOL": torch.bool,
-    }
-
     try:
         # Initial read of shard 0 into slot 0 by reader
         if is_reader:
@@ -800,7 +811,7 @@ def _stream_direct_io_broadcast(
                     continue
 
                 dtype_str = meta.get("dtype", "BF16")
-                dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
                 shape = tuple(meta.get("shape", ()))
 
                 # Construct zero-copy tensor view from shared memory
