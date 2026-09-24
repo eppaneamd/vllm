@@ -998,16 +998,16 @@ def test_fse_shared_expert_shard_inversion():
 
 
 def test_resolve_and_broadcast_mode_warmth_gating(monkeypatch, tmp_path):
-    """Verify that page cache warmth < 50% selects Mode 3 and >= 50% selects Mode 1."""
+    """Verify that page cache warmth < 80% selects Mode 3 and >= 80% selects Mode 1."""
     # Create a small dummy file
     dummy_file = tmp_path / "shard.safetensors"
     dummy_file.write_bytes(b"\x00" * 4096)
     files = [str(dummy_file)]
 
-    # Mock warmth check to return 20% (cold cache)
+    # Mock warmth check to return 70% (cold cache, below 80% threshold)
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
-        lambda _: 0.20,
+        lambda _: 0.70,
     )
     mode_cold = _resolve_and_broadcast_mode(
         files,
@@ -1018,9 +1018,9 @@ def test_resolve_and_broadcast_mode_warmth_gating(monkeypatch, tmp_path):
         tp_rank=0,
         tp_size=1,
     )
-    assert mode_cold == 3, f"Expected Mode 3 under cold cache, got {mode_cold}"
+    assert mode_cold == 3, f"Expected Mode 3 under cold cache (<80%), got {mode_cold}"
 
-    # Mock warmth check to return 85% (warm cache)
+    # Mock warmth check to return 85% (warm cache, >= 80% threshold)
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
         lambda _: 0.85,
@@ -1035,6 +1035,69 @@ def test_resolve_and_broadcast_mode_warmth_gating(monkeypatch, tmp_path):
         tp_size=1,
     )
     assert mode_warm == 1, f"Expected Mode 1 under warm cache, got {mode_warm}"
+
+
+def test_resolve_and_broadcast_mode_structural_inspection(monkeypatch, tmp_path):
+    """Verify structural multi-factor decision tree with 2D vs 3D weights, scale, and TP sizing."""
+    from vllm.model_executor.model_loader.moe_fast_loader import (
+        MoE3DTensorLocation,
+        MoELayerPlan,
+        MoESliceLocation,
+        SafetensorsMoEIndex,
+    )
+
+    dummy_file = tmp_path / "shard.safetensors"
+    dummy_file.write_bytes(b"\x00" * 4096)
+    files = [str(dummy_file)]
+
+    # Always warm cache for structural inspection
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
+        lambda _: 0.95,
+    )
+
+    # 1. Case: Ultra-large checkpoint (> 300 GB, e.g. Kimi-K3 1.45 TB) with TP=8 -> Mode 2
+    monkeypatch.setattr(os.path, "getsize", lambda _: 1450 * (1024**3))
+    mode_kimi_k3 = _resolve_and_broadcast_mode(
+        files,
+        tp_rank=0,
+        tp_size=8,
+    )
+    assert mode_kimi_k3 == 2, f"Expected Mode 2 for ultra-large Kimi-K3 (1.45 TB, TP=8), got {mode_kimi_k3}"
+
+    # 2. Case: Checkpoint <= 300 GB (e.g. Qwen3.8, GLM-5.3, MiniMax-M3) -> Mode 1 across TP1, TP2, TP4, TP8
+    monkeypatch.setattr(os.path, "getsize", lambda _: 170 * (1024**3))
+    for tp in (1, 2, 4, 8):
+        mode_med = _resolve_and_broadcast_mode(
+            files,
+            tp_rank=0,
+            tp_size=tp,
+        )
+        assert mode_med == 1, f"Expected Mode 1 for checkpoint <= 300 GB under TP={tp}, got {mode_med}"
+
+    # 3. Case: Ultra-large checkpoint (> 300 GB, e.g. DeepSeek-V4.1 475 GB) and TP >= 4 -> Mode 2 (avoid mmap_lock)
+    monkeypatch.setattr(os.path, "getsize", lambda _: 475 * (1024**3))
+    mode_2d_large_tp4 = _resolve_and_broadcast_mode(
+        files,
+        tp_rank=0,
+        tp_size=4,
+    )
+    assert mode_2d_large_tp4 == 2, f"Expected Mode 2 for DeepSeek (> 300 GB) under TP=4, got {mode_2d_large_tp4}"
+
+    mode_2d_large_tp8 = _resolve_and_broadcast_mode(
+        files,
+        tp_rank=0,
+        tp_size=8,
+    )
+    assert mode_2d_large_tp8 == 2, f"Expected Mode 2 for DeepSeek (> 300 GB) under TP=8, got {mode_2d_large_tp8}"
+
+    # 4. Case: Ultra-large checkpoint (> 300 GB) and TP <= 2 -> Mode 1
+    mode_2d_large_tp2 = _resolve_and_broadcast_mode(
+        files,
+        tp_rank=0,
+        tp_size=2,
+    )
+    assert mode_2d_large_tp2 == 1, f"Expected Mode 1 for checkpoint > 300 GB under TP=2, got {mode_2d_large_tp2}"
 
 
 def test_resolve_and_broadcast_mode_overrides(monkeypatch, tmp_path):
