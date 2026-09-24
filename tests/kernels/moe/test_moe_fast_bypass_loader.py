@@ -1229,6 +1229,196 @@ def test_direct_block_file_reader_force_o_direct_env(monkeypatch):
         assert reader.force_o_direct is False
 
 
+def test_safetensors_moe_index_layer_completion_multi_shard(tmp_path):
+    """Verifies that SafetensorsMoEIndex correctly tracks shard spans and completion points."""
+    num_experts = 8
+    hidden_dim = 32
+    intermediate_dim = 64
+
+    # Shard 0: Layer 0 experts 0..3
+    shard0_weights = {}
+    for e in range(4):
+        shard0_weights[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard0_weights[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard0_weights[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+            hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+    p0 = str(tmp_path / "model-00001-of-00003.safetensors")
+    save_file(shard0_weights, p0)
+
+    # Shard 1: Layer 0 experts 4..7, Layer 1 experts 0..3
+    shard1_weights = {}
+    for e in range(4, 8):
+        shard1_weights[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard1_weights[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard1_weights[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+            hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+    for e in range(4):
+        shard1_weights[f"model.layers.1.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard1_weights[f"model.layers.1.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard1_weights[f"model.layers.1.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+            hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+    p1 = str(tmp_path / "model-00002-of-00003.safetensors")
+    save_file(shard1_weights, p1)
+
+    # Shard 2: Layer 1 experts 4..7
+    shard2_weights = {}
+    for e in range(4, 8):
+        shard2_weights[f"model.layers.1.mlp.experts.{e}.gate_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard2_weights[f"model.layers.1.mlp.experts.{e}.up_proj.weight"] = torch.randn(
+            intermediate_dim, hidden_dim, dtype=torch.bfloat16
+        )
+        shard2_weights[f"model.layers.1.mlp.experts.{e}.down_proj.weight"] = torch.randn(
+            hidden_dim, intermediate_dim, dtype=torch.bfloat16
+        )
+    p2 = str(tmp_path / "model-00003-of-00003.safetensors")
+    save_file(shard2_weights, p2)
+
+    index = SafetensorsMoEIndex.build([p0, p1, p2])
+
+    pfx0 = "model.layers.0.mlp.experts"
+    pfx1 = "model.layers.1.mlp.experts"
+
+    assert index.layer_shard_indices[pfx0] == {0, 1}
+    assert index.layer_shard_indices[pfx1] == {1, 2}
+
+    assert index.layers_completed_at_shard[0] == []
+    assert index.layers_completed_at_shard[1] == [pfx0]
+    assert index.layers_completed_at_shard[2] == [pfx1]
+
+
+def test_streaming_3d_layer_stager_and_pool(synthetic_moe_checkpoint):
+    """Verifies that _Streaming3DLayerStager packs 2D slices into 3D and recycles pinned buffers."""
+    from vllm.model_executor.model_loader.moe_fast_loader import (
+        PinnedHostStagingPool,
+        _Streaming3DLayerStager,
+    )
+
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+    index = SafetensorsMoEIndex.build([shard_path])
+    pool = PinnedHostStagingPool(capacity_per_shape=4)
+    stager = _Streaming3DLayerStager(index, pool)
+
+    pfx = "model.layers.0.mlp.experts"
+    plan = index.moe_layers[pfx]
+    stager.get_or_create_layer(pfx)
+
+    for e in range(num_experts):
+        g = weights[f"{pfx}.{e}.gate_proj.weight"]
+        u = weights[f"{pfx}.{e}.up_proj.weight"]
+        d = weights[f"{pfx}.{e}.down_proj.weight"]
+        gs = weights[f"{pfx}.{e}.gate_proj.weight_scale"]
+        us = weights[f"{pfx}.{e}.up_proj.weight_scale"]
+        ds = weights[f"{pfx}.{e}.down_proj.weight_scale"]
+
+        stager.copy_slice(pfx, "gate", ".weight", e, g)
+        stager.copy_slice(pfx, "up", ".weight", e, u)
+        stager.copy_slice(pfx, "down", ".weight", e, d)
+        stager.copy_slice(pfx, "gate", ".weight_scale", e, gs)
+        stager.copy_slice(pfx, "up", ".weight_scale", e, us)
+        stager.copy_slice(pfx, "down", ".weight_scale", e, ds)
+
+    yielded = dict(stager.yield_completed_layer(pfx))
+
+    # Check 3D shapes
+    assert yielded[f"{pfx}.gate_up_proj"].shape == (num_experts, 2 * intermediate_dim, hidden_dim)
+    assert yielded[f"{pfx}.down_proj"].shape == (num_experts, hidden_dim, intermediate_dim)
+    assert yielded[f"{pfx}.gate_up_proj.weight_scale"].shape == (
+        num_experts,
+        2 * (intermediate_dim // 32),
+        hidden_dim // 32,
+    )
+    assert yielded[f"{pfx}.down_proj.weight_scale"].shape == (
+        num_experts,
+        hidden_dim // 32,
+        intermediate_dim // 32,
+    )
+
+    # Check numerical bitwise equivalence
+    for e in range(num_experts):
+        expected_g = weights[f"{pfx}.{e}.gate_proj.weight"]
+        expected_u = weights[f"{pfx}.{e}.up_proj.weight"]
+        actual_gu = yielded[f"{pfx}.gate_up_proj"][e]
+        assert torch.equal(actual_gu[:intermediate_dim, :], expected_g)
+        assert torch.equal(actual_gu[intermediate_dim:, :], expected_u)
+
+        expected_d = weights[f"{pfx}.{e}.down_proj.weight"]
+        assert torch.equal(yielded[f"{pfx}.down_proj"][e], expected_d)
+
+    # Release layer and check pool recycling
+    stager.release_layer(pfx)
+    assert len(pool._pool) > 0
+    pool.clear()
+
+
+def test_streaming_3d_direct_io_broadcast_parity(synthetic_moe_checkpoint):
+    """Verifies that _stream_direct_io_broadcast yields 3D MoE tensors and accurate non-MoE tensors."""
+    from vllm.model_executor.model_loader.moe_fast_loader import _stream_direct_io_broadcast
+
+    shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (
+        synthetic_moe_checkpoint
+    )
+    index = SafetensorsMoEIndex.build([shard_path])
+
+    loaded_tensors = {}
+    for name, tensor in _stream_direct_io_broadcast(
+        [shard_path],
+        index,
+        tp_rank=0,
+        tp_size=1,
+    ):
+        loaded_tensors[name] = tensor.clone()
+
+    # Non-MoE tensors preserved
+    assert "model.embed_tokens.weight" in loaded_tensors
+    assert torch.equal(loaded_tensors["model.embed_tokens.weight"], weights["model.embed_tokens.weight"])
+    assert "model.norm.weight" in loaded_tensors
+    assert torch.equal(loaded_tensors["model.norm.weight"], weights["model.norm.weight"])
+
+    # MoE weights emitted as 3D (no individual 2D slice keys!)
+    for l in range(num_layers):
+        pfx = f"model.layers.{l}.mlp.experts"
+        assert f"{pfx}.gate_up_proj" in loaded_tensors
+        assert f"{pfx}.down_proj" in loaded_tensors
+        assert loaded_tensors[f"{pfx}.gate_up_proj"].dim() == 3
+        assert loaded_tensors[f"{pfx}.down_proj"].dim() == 3
+
+        # Zero 2D slice keys emitted
+        for e in range(num_experts):
+            assert f"{pfx}.{e}.gate_proj.weight" not in loaded_tensors
+            assert f"{pfx}.{e}.down_proj.weight" not in loaded_tensors
+
+        # Verify numerical parity for gate_up and down
+        for e in range(num_experts):
+            eg = weights[f"{pfx}.{e}.gate_proj.weight"]
+            eu = weights[f"{pfx}.{e}.up_proj.weight"]
+            actual_gu = loaded_tensors[f"{pfx}.gate_up_proj"][e]
+            assert torch.equal(actual_gu[:intermediate_dim, :], eg)
+            assert torch.equal(actual_gu[intermediate_dim:, :], eu)
+
+            ed = weights[f"{pfx}.{e}.down_proj.weight"]
+            assert torch.equal(loaded_tensors[f"{pfx}.down_proj"][e], ed)
+
+
+
 
 
 

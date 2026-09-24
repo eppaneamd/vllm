@@ -191,31 +191,46 @@ class PinnedHostStagingPool:
 
     Caches pinned host tensors by (shape, dtype) to eliminate repeated
     hipHostMalloc / cudaHostAlloc driver allocation and page-locking overhead.
+    Supports asynchronous CUDA Event double-buffering for race-free reuse.
     """
 
-    def __init__(self, capacity_per_shape: int = 2):
-        self.capacity = capacity_per_shape
-        self._pool: dict[tuple[tuple[int, ...], torch.dtype], list[torch.Tensor]] = (
-            defaultdict(list)
-        )
+    def __init__(self, capacity_per_shape: int = 2, capacity: int | None = None):
+        self.capacity = capacity if capacity is not None else capacity_per_shape
+        self._pool: dict[
+            tuple[tuple[int, ...], torch.dtype],
+            list[tuple[torch.Tensor, torch.cuda.Event | None]],
+        ] = defaultdict(list)
 
     def acquire(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         key = (shape, dtype)
         if self._pool[key]:
-            buf = self._pool[key].pop()
+            buf, event = self._pool[key].pop()
+            if event is not None and torch.cuda.is_available():
+                event.synchronize()
             buf.zero_()
             return buf
         pin = torch.cuda.is_available()
         return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=pin)
 
-    def release(self, tensor: torch.Tensor) -> None:
+    def release(
+        self,
+        tensor: torch.Tensor,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
         key = (tuple(tensor.shape), tensor.dtype)
         if len(self._pool[key]) < self.capacity:
-            self._pool[key].append(tensor)
+            self._pool[key].append((tensor, event))
         else:
+            if event is not None and torch.cuda.is_available():
+                event.synchronize()
             del tensor
 
     def clear(self) -> None:
+        if torch.cuda.is_available():
+            for entries in self._pool.values():
+                for _, event in entries:
+                    if event is not None:
+                        event.synchronize()
         self._pool.clear()
 
 
@@ -229,7 +244,7 @@ class SafetensorsMoEIndex:
         fse_enabled: bool = False,
         n_shared_experts: int = 1,
     ):
-        self.hf_weights_files = hf_weights_files
+        self.hf_weights_files = sorted(hf_weights_files)
         self.local_expert_ids = local_expert_ids
         self.fse_enabled = fse_enabled
         self.n_shared_experts = n_shared_experts
@@ -245,6 +260,10 @@ class SafetensorsMoEIndex:
 
         # Open file handles for safe_open: shard_file -> safe_open handle
         self.handles: dict[str, Any] = {}
+
+        # Shard index mapping and completion tracking across layers
+        self.layer_shard_indices: dict[str, set[int]] = defaultdict(set)
+        self.layers_completed_at_shard: dict[int, list[str]] = defaultdict(list)
 
     @classmethod
     def build(
@@ -276,7 +295,10 @@ class SafetensorsMoEIndex:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             headers = list(executor.map(read_header, self.hf_weights_files))
 
+        file_to_idx = {f: i for i, f in enumerate(self.hf_weights_files)}
+
         for shard_file, header_size, header in headers:
+            shard_idx = file_to_idx[shard_file]
             self.shard_headers[shard_file] = (header_size, header)
             for key, meta in header.items():
                 if key == "__metadata__":
@@ -284,6 +306,9 @@ class SafetensorsMoEIndex:
 
                 m_2d = _MOE_2D_KEY_RE.match(key)
                 if m_2d:
+                    prefix = m_2d.group("prefix")
+                    self.layer_shard_indices[prefix].add(shard_idx)
+
                     expert_id = int(m_2d.group("expert_id"))
                     if (
                         self.local_expert_ids is not None
@@ -292,7 +317,6 @@ class SafetensorsMoEIndex:
                         # Drop non-local expert slice upfront (EP pruning)
                         continue
 
-                    prefix = m_2d.group("prefix")
                     proj = m_2d.group("proj")
                     suffix = m_2d.group("suffix") or ""
 
@@ -357,6 +381,7 @@ class SafetensorsMoEIndex:
 
                 if is_3d_moe:
                     prefix = m_3d.group("prefix")
+                    self.layer_shard_indices[prefix].add(shard_idx)
                     suffix = m_3d.group("suffix") or ""
                     dtype_str = meta.get("dtype", "BF16")
                     dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str, torch.bfloat16)
@@ -432,6 +457,7 @@ class SafetensorsMoEIndex:
                         (p for p in self.moe_layers if p.startswith(prefix)),
                         prefix,
                     )
+                    self.layer_shard_indices[routed_prefix].add(shard_idx)
                     if routed_prefix not in self.moe_layers:
                         self.moe_layers[routed_prefix] = MoELayerPlan(
                             layer_prefix=routed_prefix,
@@ -449,6 +475,14 @@ class SafetensorsMoEIndex:
                 plan.num_total_experts = plan.num_routed_experts + self.n_shared_experts
             else:
                 plan.num_total_experts = plan.num_routed_experts
+
+        # Map each shard index to the MoE layers that complete at that shard
+        for prefix, shard_indices in self.layer_shard_indices.items():
+            if shard_indices:
+                last_shard = max(shard_indices)
+                self.layers_completed_at_shard[last_shard].append(prefix)
+        for s_idx in self.layers_completed_at_shard:
+            self.layers_completed_at_shard[s_idx].sort()
 
     def open_handles(self) -> None:
         for shard_file in self.hf_weights_files:
@@ -765,6 +799,263 @@ def check_page_cache_warmth(
         return 1.0
 
 
+class _Streaming3DLayerStager:
+    """Consolidates streaming 2D MoE expert slices into contiguous 3D host staging buffers.
+
+    Eliminates thousands of uncoalesced micro-DMAs and generator iteration stalls
+    by staging active layers in a bounded pinned host pool (capacity_per_shape=2)
+    and yielding complete 3D tensors on layer boundary completion.
+    """
+
+    def __init__(
+        self,
+        index: SafetensorsMoEIndex,
+        pool: PinnedHostStagingPool,
+        local_expert_ids: set[int] | None = None,
+    ):
+        self.index = index
+        self.pool = pool
+        self.local_expert_ids = local_expert_ids
+        # layer_prefix -> dict of (proj_key, suffix) -> (buf, inter_dim, clean_suf)
+        self.active_layers: dict[
+            str, dict[tuple[str, str], tuple[torch.Tensor, int, str]]
+        ] = {}
+        # layer_prefix -> eid_to_slot dict
+        self.eid_to_slots: dict[str, dict[int, int]] = {}
+
+    def get_or_create_layer(
+        self, layer_prefix: str
+    ) -> dict[tuple[str, str], tuple[torch.Tensor, int, str]]:
+        if layer_prefix in self.active_layers:
+            return self.active_layers[layer_prefix]
+
+        plan = self.index.moe_layers[layer_prefix]
+        if self.local_expert_ids is not None:
+            active_eids = sorted(self.local_expert_ids)
+        else:
+            active_eids = list(range(plan.num_total_experts))
+
+        num_local = len(active_eids)
+        eid_to_slot = {eid: idx for idx, eid in enumerate(active_eids)}
+        self.eid_to_slots[layer_prefix] = eid_to_slot
+
+        layer_bufs: dict[tuple[str, str], tuple[torch.Tensor, int, str]] = {}
+
+        if plan.slices:
+            suffixes = {suf for (_, suf) in plan.slices.keys()}
+            for suf in sorted(suffixes):
+                clean_suf = suf if (suf.startswith(".") or not suf) else f".{suf}"
+                if suf in ("", ".weight"):
+                    clean_suf = ""
+
+                gate_slices = plan.slices.get(("gate", suf), {})
+                up_slices = plan.slices.get(("up", suf), {})
+                down_slices = plan.slices.get(("down", suf), {})
+
+                # Fused gate_up
+                if gate_slices and up_slices:
+                    sample_gate = next(iter(gate_slices.values()))
+                    dtype = sample_gate.dtype
+                    inter_dim = (
+                        sample_gate.shape[0] if len(sample_gate.shape) >= 2 else 0
+                    )
+                    hidden_dim = (
+                        sample_gate.shape[1] if len(sample_gate.shape) >= 2 else 0
+                    )
+
+                    if len(sample_gate.shape) == 2:
+                        fused_shape = (num_local, 2 * inter_dim, hidden_dim)
+                    elif len(sample_gate.shape) == 1:
+                        fused_shape = (num_local, 2 * inter_dim)
+                    else:
+                        fused_shape = (
+                            num_local,
+                            2 * inter_dim,
+                            *sample_gate.shape[1:],
+                        )
+
+                    fused_buf = self.pool.acquire(fused_shape, dtype)
+                    layer_bufs[("gate_up", suf)] = (fused_buf, inter_dim, clean_suf)
+                elif gate_slices:
+                    sample_gate = next(iter(gate_slices.values()))
+                    shape = (num_local, *sample_gate.shape)
+                    buf = self.pool.acquire(shape, sample_gate.dtype)
+                    layer_bufs[("gate", suf)] = (buf, 0, clean_suf)
+                elif up_slices:
+                    sample_up = next(iter(up_slices.values()))
+                    shape = (num_local, *sample_up.shape)
+                    buf = self.pool.acquire(shape, sample_up.dtype)
+                    layer_bufs[("up", suf)] = (buf, 0, clean_suf)
+
+                # Down projection
+                if down_slices:
+                    sample_down = next(iter(down_slices.values()))
+                    dtype = sample_down.dtype
+                    down_shape = (num_local, *sample_down.shape)
+                    down_buf = self.pool.acquire(down_shape, dtype)
+                    layer_bufs[("down", suf)] = (down_buf, 0, clean_suf)
+
+                # Other standalone projections
+                for (cat, s), slices in plan.slices.items():
+                    if s == suf and cat not in ("gate", "up", "down", "gate_up"):
+                        sample_other = next(iter(slices.values()))
+                        other_shape = (num_local, *sample_other.shape)
+                        other_buf = self.pool.acquire(other_shape, sample_other.dtype)
+                        layer_bufs[(cat, suf)] = (other_buf, 0, clean_suf)
+
+        self.active_layers[layer_prefix] = layer_bufs
+        return layer_bufs
+
+    def copy_slice(
+        self,
+        prefix: str,
+        proj_cat: str,
+        suffix: str,
+        expert_id: int,
+        tensor: torch.Tensor,
+    ) -> bool:
+        if prefix not in self.index.moe_layers:
+            return False
+
+        layer_bufs = self.get_or_create_layer(prefix)
+        eid_to_slot = self.eid_to_slots[prefix]
+        if expert_id not in eid_to_slot:
+            return False
+
+        slot = eid_to_slot[expert_id]
+
+        if proj_cat == "gate":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, inter_dim, _ = target
+                if len(tensor.shape) == 2:
+                    buf[slot, :inter_dim, :].copy_(tensor)
+                elif len(tensor.shape) == 1:
+                    buf[slot, :inter_dim].copy_(tensor)
+                else:
+                    buf[slot, :inter_dim, ...].copy_(tensor)
+                return True
+            target_gate = layer_bufs.get(("gate", suffix))
+            if target_gate is not None:
+                buf, _, _ = target_gate
+                buf[slot].copy_(tensor)
+                return True
+        elif proj_cat == "up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, inter_dim, _ = target
+                if len(tensor.shape) == 2:
+                    buf[slot, inter_dim:, :].copy_(tensor)
+                elif len(tensor.shape) == 1:
+                    buf[slot, inter_dim:].copy_(tensor)
+                else:
+                    buf[slot, inter_dim:, ...].copy_(tensor)
+                return True
+            target_up = layer_bufs.get(("up", suffix))
+            if target_up is not None:
+                buf, _, _ = target_up
+                buf[slot].copy_(tensor)
+                return True
+        elif proj_cat == "down":
+            target = layer_bufs.get(("down", suffix))
+            if target is not None:
+                buf, _, _ = target
+                buf[slot].copy_(tensor)
+                return True
+        elif proj_cat == "gate_up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, _, _ = target
+                buf[slot].copy_(tensor)
+                return True
+        else:
+            target = layer_bufs.get((proj_cat, suffix))
+            if target is not None:
+                buf, _, _ = target
+                buf[slot].copy_(tensor)
+                return True
+
+        return False
+
+    def copy_fse_slice(
+        self,
+        routed_prefix: str,
+        proj_cat: str,
+        suffix: str,
+        virt_eid: int,
+        chunk: torch.Tensor,
+    ) -> bool:
+        if routed_prefix not in self.index.moe_layers:
+            return False
+        layer_bufs = self.get_or_create_layer(routed_prefix)
+        eid_to_slot = self.eid_to_slots[routed_prefix]
+        if virt_eid not in eid_to_slot:
+            return False
+        slot = eid_to_slot[virt_eid]
+
+        if proj_cat == "gate":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, inter_dim, _ = target
+                if len(chunk.shape) == 2:
+                    buf[slot, :inter_dim, :].copy_(chunk)
+                elif len(chunk.shape) == 1:
+                    buf[slot, :inter_dim].copy_(chunk)
+                else:
+                    buf[slot, :inter_dim, ...].copy_(chunk)
+                return True
+        elif proj_cat == "up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, inter_dim, _ = target
+                if len(chunk.shape) == 2:
+                    buf[slot, inter_dim:, :].copy_(chunk)
+                elif len(chunk.shape) == 1:
+                    buf[slot, inter_dim:].copy_(chunk)
+                else:
+                    buf[slot, inter_dim:, ...].copy_(chunk)
+                return True
+        elif proj_cat == "down":
+            target = layer_bufs.get(("down", suffix))
+            if target is not None:
+                buf, _, _ = target
+                buf[slot].copy_(chunk)
+                return True
+        elif proj_cat == "gate_up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, _, _ = target
+                buf[slot].copy_(chunk)
+                return True
+        return False
+
+    def yield_completed_layer(
+        self, layer_prefix: str
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        if layer_prefix not in self.active_layers:
+            return
+
+        layer_bufs = self.active_layers[layer_prefix]
+        for (cat, suf), (buf, _, clean_suf) in list(layer_bufs.items()):
+            if cat == "gate_up":
+                yield_key = f"{layer_prefix}.gate_up_proj{clean_suf}"
+            elif cat == "down":
+                yield_key = f"{layer_prefix}.down_proj{clean_suf}"
+            else:
+                yield_key = f"{layer_prefix}.{cat}{clean_suf}"
+            yield yield_key, buf
+
+    def release_layer(self, layer_prefix: str) -> None:
+        if layer_prefix in self.active_layers:
+            layer_bufs = self.active_layers.pop(layer_prefix)
+            self.eid_to_slots.pop(layer_prefix, None)
+            event = torch.cuda.Event() if torch.cuda.is_available() else None
+            if event is not None:
+                event.record(torch.cuda.current_stream())
+            for (buf, _, _) in layer_bufs.values():
+                self.pool.release(buf, event=event)
+
+
 def _stream_direct_io_broadcast(
     hf_weights_files: list[str],
     index: SafetensorsMoEIndex,
@@ -778,6 +1069,8 @@ def _stream_direct_io_broadcast(
       preadv/pread with POSIX_FADV_SEQUENTIAL, saturating wire speed and warming 100% of host DRAM.
     - Peer ranks (1..tp_size-1) read zero bytes from disk, slicing their parameters directly from RAM.
     - Achieves theoretical NVMe hardware bandwidth saturation without multi-process disk contention.
+    - Mode 3+1 Streaming 3D Packing: Consolidates 2D expert slices into contiguous 3D host staging
+      buffers on the fly, eliminating tens of thousands of micro-DMAs and generator iteration stalls.
     """
     sorted_shards = sorted(hf_weights_files)
     num_shards = len(sorted_shards)
@@ -802,6 +1095,14 @@ def _stream_direct_io_broadcast(
 
     reader = DirectBlockFileReader(max_workers=max_workers) if is_reader else None
     reader_executor = ThreadPoolExecutor(max_workers=1) if is_reader else None
+
+    # Host staging pool and streaming 3D stager for bounded O(Layer) consolidation
+    staging_pool = PinnedHostStagingPool(capacity_per_shape=2)
+    stager = _Streaming3DLayerStager(
+        index=index,
+        pool=staging_pool,
+        local_expert_ids=index.local_expert_ids,
+    )
 
     try:
         # Initial read of shard 0 into slot 0 by reader
@@ -872,7 +1173,23 @@ def _stream_direct_io_broadcast(
                         and expert_id not in index.local_expert_ids
                     ):
                         continue
-                    yield key, tensor
+
+                    prefix = m_2d.group("prefix")
+                    proj = m_2d.group("proj")
+                    suffix = m_2d.group("suffix") or ""
+
+                    if proj in _GATE_NAMES:
+                        proj_cat = "gate"
+                    elif proj in _UP_NAMES:
+                        proj_cat = "up"
+                    elif proj in _DOWN_NAMES:
+                        proj_cat = "down"
+                    elif proj in _FUSED_GATE_UP_NAMES:
+                        proj_cat = "gate_up"
+                    else:
+                        proj_cat = proj
+
+                    stager.copy_slice(prefix, proj_cat, suffix, expert_id, tensor)
                     continue
 
                 m_fse = _SHARED_EXPERT_KEY_RE.match(key) if index.fse_enabled else None
@@ -887,28 +1204,58 @@ def _stream_direct_io_broadcast(
                     plan = index.moe_layers.get(routed_prefix)
                     num_routed = plan.num_routed_experts if plan else 0
 
+                    if proj in _GATE_NAMES:
+                        proj_cat = "gate"
+                    elif proj in _UP_NAMES:
+                        proj_cat = "up"
+                    elif proj in _DOWN_NAMES:
+                        proj_cat = "down"
+                    elif proj in _FUSED_GATE_UP_NAMES:
+                        proj_cat = "gate_up"
+                    else:
+                        proj_cat = proj
+
                     if index.n_shared_experts <= 1:
-                        virt_key = f"{routed_prefix}.{num_routed}.{proj}{suffix}"
-                        yield virt_key, tensor
+                        virt_eid = num_routed
+                        copied = stager.copy_fse_slice(
+                            routed_prefix, proj_cat, suffix, virt_eid, tensor
+                        )
+                        if not copied:
+                            virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
+                            yield virt_key, tensor
                     else:
                         if proj in _DOWN_NAMES or "down" in proj:
                             s_chunk = tensor.shape[-1] // index.n_shared_experts
                             for s_idx in range(index.n_shared_experts):
                                 virt_eid = num_routed + s_idx
                                 chunk = tensor[..., s_idx * s_chunk : (s_idx + 1) * s_chunk]
-                                virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
-                                yield virt_key, chunk
+                                copied = stager.copy_fse_slice(
+                                    routed_prefix, proj_cat, suffix, virt_eid, chunk
+                                )
+                                if not copied:
+                                    virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
+                                    yield virt_key, chunk
                         else:
                             s_chunk = tensor.shape[0] // index.n_shared_experts
                             for s_idx in range(index.n_shared_experts):
                                 virt_eid = num_routed + s_idx
                                 chunk = tensor[s_idx * s_chunk : (s_idx + 1) * s_chunk]
-                                virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
-                                yield virt_key, chunk
+                                copied = stager.copy_fse_slice(
+                                    routed_prefix, proj_cat, suffix, virt_eid, chunk
+                                )
+                                if not copied:
+                                    virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
+                                    yield virt_key, chunk
                     continue
 
                 # Standard non-MoE or 3D MoE key
                 yield key, tensor
+
+            # Yield all 3D tensors for layers completing at this shard
+            completed_layers = index.layers_completed_at_shard.get(idx, [])
+            for layer_prefix in completed_layers:
+                yield from stager.yield_completed_layer(layer_prefix)
+                stager.release_layer(layer_prefix)
 
             # Await prefetch completion on reader rank
             if prefetch_future is not None:
@@ -917,12 +1264,18 @@ def _stream_direct_io_broadcast(
             # Synchronize all TP ranks before advancing to next slot
             pool.barrier()
 
+        # Flush any remaining active layers
+        for remaining_prefix in list(stager.active_layers.keys()):
+            yield from stager.yield_completed_layer(remaining_prefix)
+            stager.release_layer(remaining_prefix)
+
     finally:
         if reader_executor is not None:
             reader_executor.shutdown(wait=True)
         if reader is not None:
             reader.close()
         pool.unlink() if is_reader else pool.close()
+        staging_pool.clear()
 
 
 def _consolidate_3d_host_staging(
@@ -1333,7 +1686,7 @@ def _resolve_mode_decision(
     if warmth < 0.80:
         logger.info(
             "Fast MoE Bypass: Cold page cache detected (%.1f%% < 80.0%%). "
-            "Routing to Mode 3 (Single-Reader Sequential Buffered Broadcast) to eliminate multi-rank NVMe contention and warm host DRAM.",
+            "Routing to Mode 3 (Single-Reader Sequential Buffered Broadcast with Streaming 3D Packing) to eliminate multi-rank NVMe contention and micro-DMA serialization.",
             warmth * 100.0,
         )
         return 3
