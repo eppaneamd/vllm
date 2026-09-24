@@ -1197,6 +1197,39 @@ def test_resolve_and_broadcast_mode_distributed_sync(monkeypatch, tmp_path):
     assert mode_r1 == 3
 
 
+def test_direct_block_file_reader_sequential_buffered(tmp_path):
+    """Verifies that DirectBlockFileReader default sequential buffered reader is bitwise accurate."""
+    from vllm.model_executor.model_loader.direct_block_reader import (
+        DirectBlockFileReader,
+        allocate_aligned_buffer,
+    )
+
+    test_data = os.urandom(256 * 1024)  # 256 KiB
+    test_file = tmp_path / "test_shard.bin"
+    test_file.write_bytes(test_data)
+
+    buf = bytearray(len(test_data))
+    with DirectBlockFileReader(chunk_size=64 * 1024, max_workers=2, force_o_direct=False) as reader:
+        assert not reader.force_o_direct
+        n = reader.read_file_to_buffer(str(test_file), buf)
+        assert n == len(test_data)
+        assert bytes(buf) == test_data
+
+
+def test_direct_block_file_reader_force_o_direct_env(monkeypatch):
+    """Verifies that VLLM_MOE_FORCE_O_DIRECT=1 enables force_o_direct mode."""
+    from vllm.model_executor.model_loader.direct_block_reader import DirectBlockFileReader
+
+    monkeypatch.setenv("VLLM_MOE_FORCE_O_DIRECT", "1")
+    with DirectBlockFileReader() as reader:
+        assert reader.force_o_direct is True
+
+    monkeypatch.setenv("VLLM_MOE_FORCE_O_DIRECT", "0")
+    with DirectBlockFileReader() as reader:
+        assert reader.force_o_direct is False
+
+
+
 
 
 

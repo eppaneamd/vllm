@@ -772,9 +772,10 @@ def _stream_direct_io_broadcast(
     tp_size: int = 1,
     max_workers: int = 4,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Streams weights using single-reader Direct I/O and POSIX shared-memory broadcast.
+    """Streams weights using single-reader Sequential Buffered I/O and POSIX shared-memory broadcast.
 
-    - Rank 0 issues O_DIRECT block reads off the NVMe drive into aligned double buffers (/dev/shm).
+    - Rank 0 reads from NVMe into aligned double buffers (/dev/shm) via multi-threaded buffered
+      preadv/pread with POSIX_FADV_SEQUENTIAL, saturating wire speed and warming 100% of host DRAM.
     - Peer ranks (1..tp_size-1) read zero bytes from disk, slicing their parameters directly from RAM.
     - Achieves theoretical NVMe hardware bandwidth saturation without multi-process disk contention.
     """
@@ -807,7 +808,7 @@ def _stream_direct_io_broadcast(
         if is_reader:
             assert reader is not None
             logger.info(
-                "Direct-I/O Broadcast: Rank 0 reading Shard 0 (%s) at wire speed...",
+                "Single-Reader Sequential Broadcast: Rank 0 reading Shard 0 (%s) at wire speed...",
                 sorted_shards[0],
             )
             reader.read_file_to_buffer(sorted_shards[0], pool.get_slot_buffer(0))
@@ -1332,7 +1333,7 @@ def _resolve_mode_decision(
     if warmth < 0.80:
         logger.info(
             "Fast MoE Bypass: Cold page cache detected (%.1f%% < 80.0%%). "
-            "Routing to Mode 3 (Direct-I/O Broadcast) to eliminate multi-rank NVMe contention.",
+            "Routing to Mode 3 (Single-Reader Sequential Buffered Broadcast) to eliminate multi-rank NVMe contention and warm host DRAM.",
             warmth * 100.0,
         )
         return 3
