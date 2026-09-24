@@ -10,6 +10,7 @@ import torch
 from vllm.model_executor.model_loader.moe_fast_loader import (
     SafetensorsMoEIndex,
     fast_bypass_safetensors_iterator,
+    _resolve_and_broadcast_mode,
 )
 
 
@@ -994,6 +995,144 @@ def test_fse_shared_expert_shard_inversion():
             yielded_keys[f"model.layers.0.mlp.experts.{num_routed}.gate_proj.weight"],
             shard0_weights["model.layers.0.mlp.shared_experts.gate_proj.weight"],
         )
+
+
+def test_resolve_and_broadcast_mode_warmth_gating(monkeypatch, tmp_path):
+    """Verify that page cache warmth < 50% selects Mode 3 and >= 50% selects Mode 1."""
+    # Create a small dummy file
+    dummy_file = tmp_path / "shard.safetensors"
+    dummy_file.write_bytes(b"\x00" * 4096)
+    files = [str(dummy_file)]
+
+    # Mock warmth check to return 20% (cold cache)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
+        lambda _: 0.20,
+    )
+    mode_cold = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=None,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=1,
+    )
+    assert mode_cold == 3, f"Expected Mode 3 under cold cache, got {mode_cold}"
+
+    # Mock warmth check to return 85% (warm cache)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
+        lambda _: 0.85,
+    )
+    mode_warm = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=None,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=1,
+    )
+    assert mode_warm == 1, f"Expected Mode 1 under warm cache, got {mode_warm}"
+
+
+def test_resolve_and_broadcast_mode_overrides(monkeypatch, tmp_path):
+    """Verify that manual overrides take precedence over automatic warmth gating."""
+    dummy_file = tmp_path / "shard.safetensors"
+    dummy_file.write_bytes(b"\x00" * 4096)
+    files = [str(dummy_file)]
+
+    # Under warm cache (which would naturally pick Mode 1), manual use_direct_io=True forces Mode 3
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
+        lambda _: 0.95,
+    )
+    mode_dio = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=True,
+        use_direct_vram=None,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=1,
+    )
+    assert mode_dio == 3
+
+    # Manual use_direct_vram=True forces Mode 2
+    mode_vram = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=True,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=1,
+    )
+    assert mode_vram == 2
+
+    # Threshold override smaller than file size forces Mode 2
+    mode_thresh = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=None,
+        env_threshold_gb=0.000001,  # ~1 KB, file is 4 KB
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=1,
+    )
+    assert mode_thresh == 2
+
+
+def test_resolve_and_broadcast_mode_distributed_sync(monkeypatch, tmp_path):
+    """Verify that Rank 0 broadcasts selected mode to peer TP ranks when distributed is active."""
+    dummy_file = tmp_path / "shard.safetensors"
+    dummy_file.write_bytes(b"\x00" * 4096)
+    files = [str(dummy_file)]
+
+    # Mock warmth check on rank 0
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.moe_fast_loader.check_page_cache_warmth",
+        lambda _: 0.15,
+    )
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    broadcasted_data = []
+
+    def mock_broadcast_object_list(object_list, src=0):
+        if src == 0 and object_list[0] != 0:
+            broadcasted_data.append(object_list[0])
+        elif len(broadcasted_data) > 0:
+            object_list[0] = broadcasted_data[0]
+
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", mock_broadcast_object_list)
+
+    # Rank 0 resolves mode 3 and broadcasts
+    mode_r0 = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=None,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=0,
+        tp_size=2,
+    )
+    assert mode_r0 == 3
+    assert broadcasted_data == [3]
+
+    # Rank 1 receives broadcasted mode 3
+    mode_r1 = _resolve_and_broadcast_mode(
+        files,
+        use_direct_io=None,
+        use_direct_vram=None,
+        env_threshold_gb=None,
+        direct_vram_threshold_gb=None,
+        tp_rank=1,
+        tp_size=2,
+    )
+    assert mode_r1 == 3
+
 
 
 

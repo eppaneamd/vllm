@@ -1285,6 +1285,93 @@ def _consolidate_3d_host_staging(
         pool.clear()
 
 
+def _resolve_and_broadcast_mode(
+    hf_weights_files: list[str],
+    use_direct_io: bool | None,
+    use_direct_vram: bool | None,
+    env_threshold_gb: float | None,
+    direct_vram_threshold_gb: float | None,
+    tp_rank: int,
+    tp_size: int,
+) -> int:
+    """Deterministically resolves loader mode on Rank 0 and broadcasts to TP ranks.
+
+    Returns:
+        1: Mode 1 (Bulk 3D Host Staging with Bounded Pinned Pool)
+        2: Mode 2 (Shard-Driven Direct-to-VRAM with Pipelined Prefetching)
+        3: Mode 3 (Direct-I/O Single-Reader Broadcast)
+    """
+    selected_mode = 0
+    if tp_rank == 0:
+        total_bytes = sum(os.path.getsize(f) for f in hf_weights_files)
+        total_gb = total_bytes / (1024**3)
+
+        # 1. Explicit user manual overrides
+        if use_direct_io is True:
+            selected_mode = 3
+        elif use_direct_vram is True:
+            selected_mode = 2
+        elif env_threshold_gb is not None and total_gb > env_threshold_gb:
+            selected_mode = 2
+        elif (
+            direct_vram_threshold_gb is not None
+            and direct_vram_threshold_gb != 100.0
+            and total_gb > direct_vram_threshold_gb
+        ):
+            selected_mode = 2
+        else:
+            # 2. Cache-warmth gating
+            warmth = check_page_cache_warmth(hf_weights_files)
+            logger.info(
+                "Fast MoE Bypass (Rank 0): Page cache warmth check: %.1f%% resident pages "
+                "(Total checkpoint size: %.2f GiB across %d shards).",
+                warmth * 100.0,
+                total_gb,
+                len(hf_weights_files),
+            )
+            if warmth < 0.50:
+                logger.info(
+                    "Fast MoE Bypass (Rank 0): Cold page cache detected (%.1f%% < 50.0%%). "
+                    "Routing to Mode 3 (Direct-I/O Broadcast) to eliminate multi-rank NVMe contention.",
+                    warmth * 100.0,
+                )
+                selected_mode = 3
+            else:
+                logger.info(
+                    "Fast MoE Bypass (Rank 0): Warm page cache detected (%.1f%% >= 50.0%%). "
+                    "Routing to Mode 1 (Bulk 3D Host Staging with Bounded Pinned Pool).",
+                    warmth * 100.0,
+                )
+                selected_mode = 1
+
+    # Synchronize across tensor parallel ranks if distributed is active
+    if tp_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+        mode_list = [selected_mode]
+        torch.distributed.broadcast_object_list(mode_list, src=0)
+        selected_mode = mode_list[0]
+    elif tp_rank != 0 and selected_mode == 0:
+        # Fallback for non-rank-0 when distributed is not initialized
+        total_bytes = sum(os.path.getsize(f) for f in hf_weights_files)
+        total_gb = total_bytes / (1024**3)
+        if use_direct_io is True:
+            selected_mode = 3
+        elif use_direct_vram is True:
+            selected_mode = 2
+        elif env_threshold_gb is not None and total_gb > env_threshold_gb:
+            selected_mode = 2
+        elif (
+            direct_vram_threshold_gb is not None
+            and direct_vram_threshold_gb != 100.0
+            and total_gb > direct_vram_threshold_gb
+        ):
+            selected_mode = 2
+        else:
+            warmth = check_page_cache_warmth(hf_weights_files)
+            selected_mode = 3 if warmth < 0.50 else 1
+
+    return selected_mode
+
+
 def fast_bypass_safetensors_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int] | None = None,
@@ -1346,35 +1433,25 @@ def fast_bypass_safetensors_iterator(
         use_direct_vram = None
 
     env_thresh = os.environ.get("VLLM_FAST_MOE_DIRECT_VRAM_THRESHOLD_GB")
+    env_threshold_gb = None
     if env_thresh is not None:
         try:
-            threshold_gb = float(env_thresh)
+            env_threshold_gb = float(env_thresh)
         except ValueError:
-            threshold_gb = direct_vram_threshold_gb
-    else:
-        threshold_gb = direct_vram_threshold_gb
+            pass
+
+    selected_mode = _resolve_and_broadcast_mode(
+        hf_weights_files,
+        use_direct_io=use_direct_io,
+        use_direct_vram=use_direct_vram,
+        env_threshold_gb=env_threshold_gb,
+        direct_vram_threshold_gb=direct_vram_threshold_gb,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
 
     total_bytes = sum(os.path.getsize(f) for f in hf_weights_files)
     total_gb = total_bytes / (1024**3)
-
-    # Resolve mode selection
-    if use_direct_io is True:
-        selected_mode = 3
-    elif use_direct_vram is True:
-        selected_mode = 2
-    elif total_gb <= threshold_gb:
-        selected_mode = 1
-    else:
-        # Checkpoint > 100 GB: check page cache warmth to pick Mode 2 vs Mode 3
-        warmth = check_page_cache_warmth(hf_weights_files)
-        logger.info(
-            "Fast MoE Bypass: Host page cache warmth check returned %.1f%% resident pages.",
-            warmth * 100.0,
-        )
-        if warmth < 0.50:
-            selected_mode = 3
-        else:
-            selected_mode = 2
 
     if selected_mode == 3:
         logger.info(
