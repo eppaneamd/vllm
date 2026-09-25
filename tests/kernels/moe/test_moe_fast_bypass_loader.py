@@ -670,6 +670,35 @@ def test_hand_rolled_moe_load_weights_compatibility(synthetic_3d_moe_checkpoint)
     assert torch.equal(layer.w2_weight, weights[f"{prefix0}.down_proj"])
 
 
+def test_fast_slice_packer_load_inline():
+    """Verifies that C++ OpenMP Batch Slice Packer compiles and performs byte-accurate batch copies."""
+    from vllm.model_executor.model_loader.moe_fast_loader import _get_fast_slice_packer
+
+    packer = _get_fast_slice_packer()
+    assert packer is not None, "Failed to compile/load C++ fast slice packer"
+
+    # Test synthetic multi-slice copy
+    num_ops = 50
+    slice_size = 128
+    src = torch.randint(0, 255, (num_ops * slice_size * 2,), dtype=torch.uint8)
+    dst = torch.zeros(num_ops * slice_size, dtype=torch.uint8)
+
+    ops_list = []
+    expected_dst = torch.zeros_like(dst)
+
+    for i in range(num_ops):
+        dst_off = i * slice_size
+        src_off = i * slice_size * 2
+        ops_list.append([dst_off, src_off, slice_size])
+        expected_dst[dst_off : dst_off + slice_size] = src[src_off : src_off + slice_size]
+
+    ops_tensor = torch.tensor(ops_list, dtype=torch.int64)
+    packer.batch_copy_slices(dst.data_ptr(), src.data_ptr(), ops_tensor)
+
+    assert torch.equal(dst, expected_dst), "Batch slice copy data mismatch"
+
+
+
 def test_mode2_direct_vram_streaming(synthetic_moe_checkpoint):
     """Verifies that Mode 2 (direct_vram_mode=True) streams all keys with pipelined prefetching."""
     shard_path, weights, num_layers, num_experts, hidden_dim, intermediate_dim = (

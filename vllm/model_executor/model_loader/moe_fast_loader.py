@@ -18,6 +18,7 @@ import math
 import os
 import re
 import struct
+import time
 from typing import Any
 
 from safetensors import safe_open
@@ -95,6 +96,65 @@ def _resolve_safetensors_dtype(
             dtype = torch.float64
 
     return dtype
+
+
+_FAST_SLICE_PACKER = None
+_FAST_SLICE_PACKER_TRIED = False
+
+
+def _get_fast_slice_packer() -> Any | None:
+    """Lazily compiles and returns the C++ OpenMP batch slice packer via load_inline."""
+    global _FAST_SLICE_PACKER, _FAST_SLICE_PACKER_TRIED
+    if _FAST_SLICE_PACKER_TRIED:
+        return _FAST_SLICE_PACKER
+
+    _FAST_SLICE_PACKER_TRIED = True
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        cpp_source = """
+#include <torch/extension.h>
+#include <cstring>
+#include <cstdint>
+#include <omp.h>
+
+void batch_copy_slices(
+    intptr_t dst_base_ptr,
+    intptr_t src_base_ptr,
+    at::Tensor ops_tensor
+) {
+    uint8_t* dst = reinterpret_cast<uint8_t*>(dst_base_ptr);
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(src_base_ptr);
+    const int64_t* ops = ops_tensor.data_ptr<int64_t>();
+    const int64_t num_ops = ops_tensor.size(0);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < num_ops; ++i) {
+        int64_t dst_off = ops[i * 3 + 0];
+        int64_t src_off = ops[i * 3 + 1];
+        int64_t nbytes  = ops[i * 3 + 2];
+        std::memcpy(dst + dst_off, src + src_off, nbytes);
+    }
+}
+"""
+        _FAST_SLICE_PACKER = load_inline(
+            name="vllm_moe_fast_slice_packer",
+            cpp_sources=cpp_source,
+            functions=["batch_copy_slices"],
+            extra_cflags=["-O3", "-fopenmp"],
+            extra_ldflags=["-fopenmp"],
+            verbose=False,
+        )
+        logger.info("[FastMoE] C++ OpenMP Batch Slice Packer compiled and loaded successfully.")
+    except Exception as e:
+        logger.warning(
+            "[FastMoE] C++ OpenMP Batch Slice Packer compilation failed (%s); falling back to PyTorch slicing.",
+            e,
+        )
+        _FAST_SLICE_PACKER = None
+
+    return _FAST_SLICE_PACKER
+
 
 # Regex matching standard MoE expert slice keys across model families:
 # e.g.:
@@ -977,6 +1037,61 @@ class _Streaming3DLayerStager:
 
         return False
 
+    def get_slice_dest(
+        self,
+        prefix: str,
+        proj_cat: str,
+        suffix: str,
+        expert_id: int,
+        t_len: int,
+    ) -> tuple[torch.Tensor, int] | None:
+        """Computes destination 3D staging buffer and byte offset for an MoE slice."""
+        if prefix not in self.index.moe_layers:
+            return None
+
+        layer_bufs = self.get_or_create_layer(prefix)
+        eid_to_slot = self.eid_to_slots.get(prefix)
+        if eid_to_slot is None or expert_id not in eid_to_slot:
+            return None
+
+        slot = eid_to_slot[expert_id]
+
+        if proj_cat == "gate":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, _, _ = target
+                return buf, slot * (2 * t_len)
+            target_gate = layer_bufs.get(("gate", suffix))
+            if target_gate is not None:
+                buf, _, _ = target_gate
+                return buf, slot * t_len
+        elif proj_cat == "up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, _, _ = target
+                return buf, slot * (2 * t_len) + t_len
+            target_up = layer_bufs.get(("up", suffix))
+            if target_up is not None:
+                buf, _, _ = target_up
+                return buf, slot * t_len
+        elif proj_cat == "down":
+            target = layer_bufs.get(("down", suffix))
+            if target is not None:
+                buf, _, _ = target
+                return buf, slot * t_len
+        elif proj_cat == "gate_up":
+            target = layer_bufs.get(("gate_up", suffix))
+            if target is not None:
+                buf, _, _ = target
+                return buf, slot * t_len
+        else:
+            target = layer_bufs.get((proj_cat, suffix))
+            if target is not None:
+                buf, _, _ = target
+                return buf, slot * t_len
+
+        return None
+
     def copy_fse_slice(
         self,
         routed_prefix: str,
@@ -1104,6 +1219,10 @@ def _stream_direct_io_broadcast(
         local_expert_ids=index.local_expert_ids,
     )
 
+    packer = _get_fast_slice_packer()
+    pending_non_moe: dict[int, list[tuple[str, torch.Tensor]]] = defaultdict(list)
+    completed_layer_indices: set[int] = set()
+
     try:
         # Initial read of shard 0 into slot 0 by reader
         if is_reader:
@@ -1118,6 +1237,7 @@ def _stream_direct_io_broadcast(
         pool.barrier()
 
         for idx, shard_path in enumerate(sorted_shards):
+            shard_t0 = time.perf_counter()
             curr_slot = idx % 2
             next_slot = (idx + 1) % 2
             curr_buf = pool.get_slot_buffer(curr_slot)
@@ -1135,6 +1255,11 @@ def _stream_direct_io_broadcast(
             # All ranks consume curr_buf in parallel
             header_size, header = index.shard_headers[shard_path]
             data_start_offset = 8 + header_size
+
+            # Batch slice copy operations for fast C++ OpenMP packer:
+            # buf_ptr -> list of (dst_offset, src_offset, nbytes)
+            batch_ops: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+            num_batched_slices = 0
 
             for key, meta in header.items():
                 if key == "__metadata__":
@@ -1157,12 +1282,7 @@ def _stream_direct_io_broadcast(
                     dtype_str, expected_itemsize=expected_itemsize
                 )
 
-                # Construct zero-copy tensor view from shared memory
                 byte_offset = data_start_offset + t_start
-                raw_view = torch.frombuffer(
-                    curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
-                )
-                tensor = raw_view.view(dtype).reshape(shape)
 
                 # Check MoE keys vs non-MoE keys
                 m_2d = _MOE_2D_KEY_RE.match(key)
@@ -1189,6 +1309,20 @@ def _stream_direct_io_broadcast(
                     else:
                         proj_cat = proj
 
+                    if packer is not None:
+                        dest = stager.get_slice_dest(
+                            prefix, proj_cat, suffix, expert_id, t_len
+                        )
+                        if dest is not None:
+                            buf, dst_offset = dest
+                            batch_ops[buf.data_ptr()].append((dst_offset, byte_offset, t_len))
+                            num_batched_slices += 1
+                            continue
+
+                    raw_view = torch.frombuffer(
+                        curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
+                    )
+                    tensor = raw_view.view(dtype).reshape(shape)
                     stager.copy_slice(prefix, proj_cat, suffix, expert_id, tensor)
                     continue
 
@@ -1217,6 +1351,20 @@ def _stream_direct_io_broadcast(
 
                     if index.n_shared_experts <= 1:
                         virt_eid = num_routed
+                        if packer is not None:
+                            dest = stager.get_slice_dest(
+                                routed_prefix, proj_cat, suffix, virt_eid, t_len
+                            )
+                            if dest is not None:
+                                buf, dst_offset = dest
+                                batch_ops[buf.data_ptr()].append((dst_offset, byte_offset, t_len))
+                                num_batched_slices += 1
+                                continue
+
+                        raw_view = torch.frombuffer(
+                            curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
+                        )
+                        tensor = raw_view.view(dtype).reshape(shape)
                         copied = stager.copy_fse_slice(
                             routed_prefix, proj_cat, suffix, virt_eid, tensor
                         )
@@ -1224,6 +1372,31 @@ def _stream_direct_io_broadcast(
                             virt_key = f"{routed_prefix}.{virt_eid}.{proj}{suffix}"
                             yield virt_key, tensor
                     else:
+                        s_chunk_bytes = t_len // index.n_shared_experts
+                        if packer is not None:
+                            all_dest_found = True
+                            chunk_ops = []
+                            for s_idx in range(index.n_shared_experts):
+                                virt_eid = num_routed + s_idx
+                                chunk_src_offset = byte_offset + s_idx * s_chunk_bytes
+                                dest = stager.get_slice_dest(
+                                    routed_prefix, proj_cat, suffix, virt_eid, s_chunk_bytes
+                                )
+                                if dest is None:
+                                    all_dest_found = False
+                                    break
+                                buf, dst_offset = dest
+                                chunk_ops.append((buf.data_ptr(), dst_offset, chunk_src_offset, s_chunk_bytes))
+                            if all_dest_found:
+                                for buf_ptr, dst_off, src_off, nbytes in chunk_ops:
+                                    batch_ops[buf_ptr].append((dst_off, src_off, nbytes))
+                                num_batched_slices += index.n_shared_experts
+                                continue
+
+                        raw_view = torch.frombuffer(
+                            curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
+                        )
+                        tensor = raw_view.view(dtype).reshape(shape)
                         if proj in _DOWN_NAMES or "down" in proj:
                             s_chunk = tensor.shape[-1] // index.n_shared_experts
                             for s_idx in range(index.n_shared_experts):
@@ -1248,14 +1421,58 @@ def _stream_direct_io_broadcast(
                                     yield virt_key, chunk
                     continue
 
-                # Standard non-MoE or 3D MoE key
-                yield key, tensor
+                # Non-MoE key: construct tensor view
+                raw_view = torch.frombuffer(
+                    curr_buf, dtype=torch.uint8, count=t_len, offset=byte_offset
+                )
+                tensor = raw_view.view(dtype).reshape(shape)
+
+                # Buffer layer non-MoE keys until layer 3D MoE completion to preserve
+                # strict preorder depth-first traversal and avoid AutoWeightsLoader splits
+                m_layer = re.search(r"\blayers\.(\d+)\b", key)
+                if m_layer:
+                    layer_idx = int(m_layer.group(1))
+                    if layer_idx in completed_layer_indices:
+                        yield key, tensor
+                    else:
+                        pending_non_moe[layer_idx].append((key, tensor.clone()))
+                else:
+                    # Global preamble (embed_tokens) or postamble (norm, lm_head)
+                    yield key, tensor
+
+            # Execute OpenMP batch slice copies for current shard
+            if batch_ops and packer is not None:
+                raw_shm_view = torch.frombuffer(curr_buf, dtype=torch.uint8)
+                curr_buf_ptr = raw_shm_view.data_ptr()
+                for buf_ptr, ops in batch_ops.items():
+                    ops_tensor = torch.tensor(ops, dtype=torch.int64)
+                    packer.batch_copy_slices(buf_ptr, curr_buf_ptr, ops_tensor)
 
             # Yield all 3D tensors for layers completing at this shard
             completed_layers = index.layers_completed_at_shard.get(idx, [])
             for layer_prefix in completed_layers:
+                m_layer = re.search(r"\blayers\.(\d+)\b", layer_prefix)
+                if m_layer:
+                    layer_idx = int(m_layer.group(1))
+                    completed_layer_indices.add(layer_idx)
+                    if layer_idx in pending_non_moe:
+                        for n_key, n_ten in pending_non_moe.pop(layer_idx):
+                            yield n_key, n_ten
+
                 yield from stager.yield_completed_layer(layer_prefix)
                 stager.release_layer(layer_prefix)
+
+            # Progress heartbeat log on reader rank
+            shard_elapsed_ms = (time.perf_counter() - shard_t0) * 1000.0
+            if is_reader and (idx % 10 == 0 or idx == num_shards - 1 or idx < 3):
+                logger.info(
+                    "[FastMoE] Shard %d/%d processed: %d MoE slices batched via C++ OpenMP in %.1f ms (%d active layers staged)",
+                    idx + 1,
+                    num_shards,
+                    num_batched_slices,
+                    shard_elapsed_ms,
+                    len(stager.active_layers),
+                )
 
             # Await prefetch completion on reader rank
             if prefetch_future is not None:
@@ -1264,10 +1481,20 @@ def _stream_direct_io_broadcast(
             # Synchronize all TP ranks before advancing to next slot
             pool.barrier()
 
-        # Flush any remaining active layers
+        # Flush any remaining active layers and buffered non-MoE weights
         for remaining_prefix in list(stager.active_layers.keys()):
+            m_layer = re.search(r"\blayers\.(\d+)\b", remaining_prefix)
+            if m_layer:
+                layer_idx = int(m_layer.group(1))
+                if layer_idx in pending_non_moe:
+                    for n_key, n_ten in pending_non_moe.pop(layer_idx):
+                        yield n_key, n_ten
             yield from stager.yield_completed_layer(remaining_prefix)
             stager.release_layer(remaining_prefix)
+
+        for layer_idx in sorted(pending_non_moe.keys()):
+            for n_key, n_ten in pending_non_moe.pop(layer_idx):
+                yield n_key, n_ten
 
     finally:
         if reader_executor is not None:
