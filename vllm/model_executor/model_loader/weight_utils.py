@@ -1170,30 +1170,11 @@ def safetensors_weights_iterator(
                     yield name, param
 
 
-def _drop_file_cache_after_load(path: str) -> None:
-    """Release checkpoint pages after weights have been loaded to reduce page-cache pressure."""
-    posix_fadvise = getattr(os, "posix_fadvise", None)
-    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
-    if posix_fadvise is None or dontneed is None:
-        return
-
-    fd = None
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        posix_fadvise(fd, 0, 0, dontneed)
-    except OSError:
-        pass
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
     local_expert_ids: list[int] | None = None,
-    drop_cache_after_load: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1241,9 +1222,6 @@ def multi_thread_safetensors_weights_iterator(
             for key in list(state_dict):
                 yield key, state_dict.pop(key)
             del state_dict
-
-            if drop_cache_after_load:
-                _drop_file_cache_after_load(st_file)
 
             futures_iter.update(1)
 

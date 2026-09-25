@@ -91,28 +91,3 @@ def test_multi_thread_safetensors_local_expert_ids_filtering(synthetic_safetenso
     # Expert scales for all experts should not be filtered out
     for exp_id in range(4):
         assert f"model.layers.0.mlp.experts.{exp_id}.scale" in loaded_dict
-
-
-def test_multi_thread_safetensors_drop_cache_after_load(synthetic_safetensors_shards):
-    """Verify drop_cache_after_load triggers cache eviction per shard."""
-    dropped_files = []
-
-    def mock_drop(file_path):
-        dropped_files.append(file_path)
-
-    with patch("vllm.model_executor.model_loader.weight_utils._drop_file_cache_after_load", mock_drop):
-        # Case 1: drop_cache_after_load = False (default)
-        list(multi_thread_safetensors_weights_iterator(
-            synthetic_safetensors_shards,
-            use_tqdm_on_load=False,
-            drop_cache_after_load=False,
-        ))
-        assert len(dropped_files) == 0
-
-        # Case 2: drop_cache_after_load = True
-        list(multi_thread_safetensors_weights_iterator(
-            synthetic_safetensors_shards,
-            use_tqdm_on_load=False,
-            drop_cache_after_load=True,
-        ))
-        assert dropped_files == synthetic_safetensors_shards
