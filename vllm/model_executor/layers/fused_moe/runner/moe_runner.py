@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -292,6 +293,16 @@ class MoERunner(MoERunnerInterface):
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
+
+        # AITER MegaMoE-TP (opt-in): when it ran, the routed output is reduced.
+        self._megamoe = None
+        self._megamoe_reduced = False
+        if envs.VLLM_ROCM_AITER_MEGAMOE_TP:
+            from vllm.model_executor.layers.fused_moe.rocm_aiter_megamoe_tp import (
+                MegaMoeTPDispatch,
+            )
+
+            self._megamoe = MegaMoeTPDispatch(self)
 
         self._forward_entry = self._select_forward()
 
@@ -634,13 +645,22 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
+            megamoe_out = (
+                self._megamoe.forward(hidden_states, topk_weights, topk_ids)
+                if self._megamoe is not None
+                else None
             )
+            self._megamoe_reduced = megamoe_out is not None
+            if megamoe_out is not None:
+                fused_out = megamoe_out
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
@@ -762,7 +782,14 @@ class MoERunner(MoERunnerInterface):
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        fused_output_is_reduced = self._fused_output_is_reduced
+        # _megamoe_reduced is set by the op body at run time, which a traced
+        # forward would not see.
+        if self._megamoe is not None and torch.compiler.is_compiling():
+            raise RuntimeError(
+                "VLLM_ROCM_AITER_MEGAMOE_TP=1 needs an eager MoE forward; this one "
+                "is torch.compiled"
+            )
+        fused_output_is_reduced = self._fused_output_is_reduced or self._megamoe_reduced
 
         # Latent routed output has to be reduced before output transform,
         # because the transform may include non-linear normalization.

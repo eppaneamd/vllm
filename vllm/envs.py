@@ -143,6 +143,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: bool | None = None
     VLLM_ROCM_USE_AITER_MOE_SITUV2: Literal["auto", "a4w4", "a8w4", "a16w4"] = "auto"
+    VLLM_ROCM_AITER_MEGAMOE_TP: bool = False
+    VLLM_ROCM_AITER_MEGAMOE_TP_MIN_TOKENS: int = 256
+    VLLM_ROCM_AITER_MEGAMOE_TP_MAX_TOKENS: int = 2048
+    VLLM_ROCM_AITER_MEGAMOE_TP_COMM_DTYPE: Literal["bf16", "fp8"] = "bf16"
+    VLLM_ROCM_AITER_MEGAMOE_TP_LB: str = ""
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
@@ -1290,6 +1295,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "a4w4", "a8w4", "a16w4", "0", "1"],
         case_sensitive=False,
+    ),
+    # Run TP MoE forwards of MIN_TOKENS..MAX_TOKENS rows (eager or captured in a
+    # CUDA graph) through AITER MegaMoE-TP, one persistent kernel that also does
+    # the TP all-reduce (gfx950, AITER MXFP4 W4A4 MoE, no unfused shared expert).
+    "VLLM_ROCM_AITER_MEGAMOE_TP": lambda: (
+        os.getenv("VLLM_ROCM_AITER_MEGAMOE_TP", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_AITER_MEGAMOE_TP_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_AITER_MEGAMOE_TP_MIN_TOKENS", "256")
+    ),
+    "VLLM_ROCM_AITER_MEGAMOE_TP_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_AITER_MEGAMOE_TP_MAX_TOKENS", "2048")
+    ),
+    # "fp8" quantizes the partial sums and gathered rows: lossy, like
+    # VLLM_ROCM_QUICK_REDUCE_QUANTIZATION; "bf16" keeps the stock precision.
+    "VLLM_ROCM_AITER_MEGAMOE_TP_COMM_DTYPE": env_with_choices(
+        "VLLM_ROCM_AITER_MEGAMOE_TP_COMM_DTYPE", "bf16", ["bf16", "fp8"]
+    ),
+    # Large-batch schedule knobs passed to MegaMoeTPConfig as lb_<key>, e.g.
+    # "mt=4;npp=2". Unset knobs keep AITER's choice.
+    "VLLM_ROCM_AITER_MEGAMOE_TP_LB": lambda: os.getenv(
+        "VLLM_ROCM_AITER_MEGAMOE_TP_LB", ""
     ),
     # Opt-in switch for a4w4 (FP4 activation) MoE on DeepSeek V4.1, AITER
     # MXFP4 backend. Default is a8w4 (FP8); set to "1" to enable a4w4
