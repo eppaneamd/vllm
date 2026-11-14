@@ -80,13 +80,16 @@ class Launcher:
         from vllm.models.qwen4_exp.amd.specialized_decode.runtime.peer import PeerBuffer
 
         self.model, self.widths, self.tp, self.rank = model, widths, tp, rank
+        self.shard = L.shard(tp)
         # zeroed: the MoE's split-unit marks are compared against step tags
         self.scratch = torch.zeros(
-            K.scratch_bytes(max(widths)), dtype=torch.uint8, device=dev
+            K.scratch_bytes(self.shard, max(widths)), dtype=torch.uint8, device=dev
         )
         self.x = torch.empty(max(widths), L.HIDDEN, dtype=torch.bfloat16, device=dev)
         # qsa_front's projections of x: qkv_proj's and index_qk_proj's outputs
-        self.qkv = torch.empty(max(widths), qsa_.QKV, dtype=torch.bfloat16, device=dev)
+        self.qkv = torch.empty(
+            max(widths), self.shard.QKV, dtype=torch.bfloat16, device=dev
+        )
         self.ixqk = torch.empty(max(widths), qsa_.IX, dtype=torch.bfloat16, device=dev)
         # vLLM's skinny GEMMs create their workspace pool on first use, which
         # must not be inside a graph capture; the decode steps no longer run

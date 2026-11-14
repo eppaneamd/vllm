@@ -755,7 +755,7 @@ def test_exchange_two_ranks(harness, mailboxes, rows, codec):
 # --------------------------------------------------------------------------
 
 
-def _gdn_kernel(rows, out=True):
+def _gdn_kernel(sh, rows, out=True):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
@@ -770,11 +770,8 @@ def _gdn_kernel(rows, out=True):
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.common.ops import ld_i32x4
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
         BLOCKS,
-        CONV_DIM,
         HIDDEN,
-        NV,
         THREADS,
-        VALUE_DIM,
     )
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import exchange as ex
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import (
@@ -783,7 +780,7 @@ def _gdn_kernel(rows, out=True):
         tiled,
     )
 
-    chunks = max(gdn.proj_plan().per, gdn.out_plan().per)
+    chunks = max(gdn.proj_plan(sh).per, gdn.out_plan(sh.VALUE_DIM).per)
 
     @fx.struct
     class Smem:
@@ -792,7 +789,9 @@ def _gdn_kernel(rows, out=True):
         red: fx.Array[fx.Float32, gdn.recur_lds_words(), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_gdn_{rows}_{int(out)}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_gdn_tp{sh.TP}_{rows}_{int(out)}", known_block_size=[THREADS, 1, 1]
+    )
     def kern(
         x: Int64,
         wq: Int64,
@@ -824,6 +823,7 @@ def _gdn_kernel(rows, out=True):
         g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
         prologue(g)
         w = gdn.Bufs(
+            **sh._asdict(),
             qkvz=wq,
             qkvz_s=wq_scale,
             shuffled=False,
@@ -834,6 +834,7 @@ def _gdn_kernel(rows, out=True):
             norm=normw,
         )
         b = gdn.Bufs(
+            **sh._asdict(),
             x=x,
             qkv=qkv,
             z=z,
@@ -843,34 +844,36 @@ def _gdn_kernel(rows, out=True):
             st_idx=st_idx,
             conv_state=conv_state,
             ssm=ssm,
-            conv_stride=fx.Int64(3 * CONV_DIM),
-            ssm_stride=fx.Int64(NV * 128 * 128),
+            conv_stride=fx.Int64(3 * sh.CONV_DIM),
+            ssm_stride=fx.Int64(sh.NV * 128 * 128),
         )
         # at the resident widths each GEMM's first weights are issued ahead,
         # the out_proj's inside the barrier before it, and the recurrence
         # polls the projection's tagged outputs, as the layer kernels do
         pre = tiled.resident(rows)
         gemm = tiled.Gemm(sm.stage.ptr, rows, tid, chunks=chunks)
-        weights = tiled.Fp4Weights(wo, wo_scale, HIDDEN, VALUE_DIM, False)
+        weights = tiled.Fp4Weights(wo, wo_scale, HIDDEN, sh.VALUE_DIM, False)
         if fx.const_expr(pre):
             gtag = fx.Int32(ld_i32x4(epoch, 0)[0]) * 128 + 9
             gdn.proj(g, gemm, w, b, rows, 0, gdn.proj_issue(g, w), gtag)
             gdn.recur(g, w, b, sm.red.ptr, rows, EPS, None, gtag)
-            out_w = tiled.issue_unit(bid, tid, weights, gdn.out_plan())
-            source = tagged.Pairs(g, core, VALUE_DIM, gtag)
+            out_w = tiled.issue_unit(bid, tid, weights, gdn.out_plan(sh.VALUE_DIM))
+            source = tagged.Pairs(g, core, sh.VALUE_DIM, gtag)
         else:
             # each GEMM's first weights preloaded, out_proj's during the
             # recurrence, as the layer kernels do up to ``tiled.PRELOAD_ROWS``
             proj_w = tiled.unit_preload(
-                gemm, gdn.proj_weights(w), gdn.proj_plan(), g.bid
+                gemm, gdn.proj_weights(w), gdn.proj_plan(sh), g.bid
             )
             gdn.proj(g, gemm, w, b, rows, 0, proj_w)
             grid_sync(g)
             out_w = None
             if fx.const_expr(out):
-                out_w = tiled.unit_preload(gemm, weights, gdn.out_plan(), g.bid)
+                out_w = tiled.unit_preload(
+                    gemm, weights, gdn.out_plan(sh.VALUE_DIM), g.bid
+                )
             gdn.recur(g, w, b, sm.red.ptr, rows, EPS)
-            source = tiled.Source(core, VALUE_DIM)
+            source = tiled.Source(core, sh.VALUE_DIM)
             if fx.const_expr(out):
                 grid_sync(g)
         if fx.const_expr(out):
@@ -884,8 +887,8 @@ def _gdn_kernel(rows, out=True):
                 part,
                 ex.GroupTile(sm.tile.ptr, rows),
                 xch,
-                VALUE_DIM,
-                200,
+                sh.VALUE_DIM,
+                max(200, gdn.proj_plan(sh).groups),
                 out_w,
             )
 
@@ -953,42 +956,41 @@ def test_gated_delta_net(harness, rows):
     and out_proj through the exchange; padding rows (slot 0: rows 3 and the
     last, the last alone below five rows, none at one row) leave the states
     alone and give a zero core."""
+    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import shard
+
     pads = sorted({min(3, rows - 1), rows - 1}) if rows > 1 else []
-    _check_gated_delta_net(harness, rows, pads, True)
+    _check_gated_delta_net(harness, shard(2), rows, pads, True)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
 def test_gated_delta_net_resident(harness, rows):
     """The gated delta net at the resident widths, out_proj through the
     exchange; the last row of two or more pads."""
-    _check_gated_delta_net(harness, rows, [rows - 1] if rows > 1 else [], True)
+    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import shard
 
-
-def _check_gated_delta_net(harness, rows, pads, out):
-    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
-        BA,
-        CONV_DIM,
-        HIDDEN,
-        NV,
-        QKVZ,
-        VALUE_DIM,
+    _check_gated_delta_net(
+        harness, shard(2), rows, [rows - 1] if rows > 1 else [], True
     )
+
+
+def _check_gated_delta_net(harness, sh, rows, pads, out):
+    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import HIDDEN
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import gdn
 
     gen = torch.Generator().manual_seed(2)
     slots = rows + 9
     x = torch.randn(rows, HIDDEN, generator=gen).to(torch.bfloat16)
-    wq_data, wq_scale, wq = mxfp4(QKVZ, HIDDEN, gen, 115, 121)
-    wba = (torch.randn(BA, HIDDEN, generator=gen) * 0.02).to(torch.bfloat16)
-    wconv = (torch.randn(CONV_DIM, 1, 4, generator=gen) * 0.5).to(torch.bfloat16)
-    a_log = torch.randn(NV, generator=gen) * 0.5
-    dt_bias = (torch.randn(NV, generator=gen) * 0.5).to(torch.bfloat16)
+    wq_data, wq_scale, wq = mxfp4(sh.QKVZ, HIDDEN, gen, 115, 121)
+    wba = (torch.randn(sh.BA, HIDDEN, generator=gen) * 0.02).to(torch.bfloat16)
+    wconv = (torch.randn(sh.CONV_DIM, 1, 4, generator=gen) * 0.5).to(torch.bfloat16)
+    a_log = torch.randn(sh.NV, generator=gen) * 0.5
+    dt_bias = (torch.randn(sh.NV, generator=gen) * 0.5).to(torch.bfloat16)
     normw = (1 + torch.randn(128, generator=gen) * 0.1).to(torch.bfloat16)
-    wo_data, wo_scale, wo = mxfp4(HIDDEN, VALUE_DIM, gen, 116, 121)
+    wo_data, wo_scale, wo = mxfp4(HIDDEN, sh.VALUE_DIM, gen, 116, 121)
     st_idx = (torch.randperm(slots - 1, generator=gen)[:rows] + 1).to(torch.int32)
     st_idx[pads] = 0
-    conv_state = torch.randn(slots, 3, CONV_DIM, generator=gen).to(torch.bfloat16)
-    ssm = torch.randn(slots, NV, 128, 128, generator=gen) * 0.05
+    conv_state = torch.randn(slots, 3, sh.CONV_DIM, generator=gen).to(torch.bfloat16)
+    ssm = torch.randn(slots, sh.NV, 128, 128, generator=gen) * 0.05
     conv_r, z_r, cs_r, ssm_r, core_r, y_r = ref.gated_delta_net(
         x, wq, wba, wconv, a_log, dt_bias, normw, wo, st_idx, conv_state, ssm, EPS
     )
@@ -1011,17 +1013,20 @@ def _check_gated_delta_net(harness, rows, pads, out):
             ssm=ssm,
         ).items()
     }
-    qkv_words, ba_words, core_words = gdn.handoff_words(rows)
+    qkv_words, ba_words, core_words = gdn.handoff_words(sh, rows)
     qkv = torch.zeros(qkv_words, dtype=torch.int32, device="cuda")
-    z = torch.zeros(rows, VALUE_DIM, dtype=torch.bfloat16, device="cuda")
+    z = torch.zeros(rows, sh.VALUE_DIM, dtype=torch.bfloat16, device="cuda")
     ba = torch.zeros(ba_words, device="cuda")
     core = torch.zeros(core_words, dtype=torch.int32, device="cuda")
     part = torch.zeros(
-        max(gdn.proj_plan().partial_words(rows), gdn.out_plan().partial_words(rows)),
+        max(
+            gdn.proj_plan(sh).partial_words(rows),
+            gdn.out_plan(sh.VALUE_DIM).partial_words(rows),
+        ),
         device="cuda",
     )
     harness.mbox_t.zero_()
-    _gdn_kernel(rows, out)(
+    _gdn_kernel(sh, rows, out)(
         *[
             d[n].data_ptr()
             for n in (
@@ -1052,15 +1057,15 @@ def _check_gated_delta_net(harness, rows, pads, out):
     )
     torch.accelerator.synchronize()
     assert harness.health[0].item() == 0
-    if qkv_words == rows * QKVZ:  # tagged (bf16 pair, tag) pairs, z included
-        qkvz = qkv.view(rows, QKVZ // 2, 2)[:, :, 0].contiguous()
-        qkvz = qkvz.view(torch.bfloat16).view(rows, QKVZ)
-        qkv, z = qkvz[:, :CONV_DIM], qkvz[:, CONV_DIM:]
+    if qkv_words == rows * sh.QKVZ:  # tagged (bf16 pair, tag) pairs, z included
+        qkvz = qkv.view(rows, sh.QKVZ // 2, 2)[:, :, 0].contiguous()
+        qkvz = qkvz.view(torch.bfloat16).view(rows, sh.QKVZ)
+        qkv, z = qkvz[:, : sh.CONV_DIM], qkvz[:, sh.CONV_DIM :]
     else:
-        qkv = qkv.view(torch.bfloat16).view(rows, CONV_DIM)
-    if core_words == rows * VALUE_DIM:  # tagged (bf16 pair, tag) pairs
-        core = core.view(rows, VALUE_DIM // 2, 2)[:, :, 0].contiguous()
-    core = core.view(torch.bfloat16).view(rows, VALUE_DIM)
+        qkv = qkv.view(torch.bfloat16).view(rows, sh.CONV_DIM)
+    if core_words == rows * sh.VALUE_DIM:  # tagged (bf16 pair, tag) pairs
+        core = core.view(rows, sh.VALUE_DIM // 2, 2)[:, :, 0].contiguous()
+    core = core.view(torch.bfloat16).view(rows, sh.VALUE_DIM)
     assert rel(qkv, conv_r) < 1e-2
     assert rel(z, z_r) < 1e-2
     assert rel(d["conv_state"], cs_r) < 1e-2
@@ -1076,10 +1081,10 @@ def _check_gated_delta_net(harness, rows, pads, out):
 # the MoE: router, routing + activation quant, experts in place, combine
 # --------------------------------------------------------------------------
 
-RIP = 384  # the padded intermediate of a TP2 rank (320 real)
+RIP = {2: 384}  # the experts' padded intermediate a rank, by TP (TP2: 320 real)
 
 
-def _moe_kernel(rows, codec="bf16"):
+def _moe_kernel(sh, rows, codec="bf16"):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
@@ -1100,7 +1105,8 @@ def _moe_kernel(rows, codec="bf16"):
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import moe, tiled
 
     digest = source_digest()  # FlyDSL does not hash the stages' sources
-    shape = moe.Shape(rows, RIP)
+    rip = RIP[sh.TP]
+    shape = moe.Shape(rows, rip, sh.RI)
     MoeLds = moe.lds_struct(shape)
 
     @fx.struct
@@ -1116,7 +1122,9 @@ def _moe_kernel(rows, codec="bf16"):
     class Smem:
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_moe_{rows}_{codec}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_moe_tp{sh.TP}_{rows}_{codec}", known_block_size=[THREADS, 1, 1]
+    )
     def kern(
         x: Int64,
         w_gate: Int64,
@@ -1138,7 +1146,7 @@ def _moe_kernel(rows, codec="bf16"):
         folds: Int64,
         health: Int64,
     ):
-        _ = digest
+        _ = (digest, sh, rip)
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         alloc = fx.SharedAllocator()
         sm = alloc.allocate(Smem).peek()
@@ -1189,7 +1197,7 @@ def _moe_kernel(rows, codec="bf16"):
         health: Int64,
         stream: fx.Stream = default_stream,
     ):
-        _ = digest
+        _ = (digest, sh, rip)
         kern(
             x,
             w_gate,
@@ -1322,12 +1330,13 @@ def test_moe(harness, rows, routing, codec):
         E_ALL,
         EXPERTS,
         HIDDEN,
-        RI,
         SLOTS,
         TOPK,
+        shard,
     )
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import moe
 
+    sh = shard(2)
     gen = torch.Generator().manual_seed(3)
     if routing == "random":
         x = torch.randn(rows, HIDDEN, generator=gen).to(torch.bfloat16)
@@ -1336,9 +1345,10 @@ def test_moe(harness, rows, routing, codec):
         x, w_gate = _routed_inputs(gen, rows, [list(range(TOPK))] * rows)
     else:
         x, w_gate = _routed_inputs(gen, rows, _skewed_picks(rows, gen))
-    w13, w13s, w13d = _expert_weights(gen, E_ALL, 2 * RIP, HIDDEN, RI, HIDDEN)
-    w2, w2s, w2d = _expert_weights(gen, E_ALL, HIDDEN, RIP, HIDDEN, RI)
-    y_r, ids_r, ws_r = ref.moe(x, w_gate, w13d, w2d, EXPERTS, TOPK, RI, RIP)
+    rip = RIP[sh.TP]
+    w13, w13s, w13d = _expert_weights(gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN)
+    w2, w2s, w2d = _expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
+    y_r, ids_r, ws_r = ref.moe(x, w_gate, w13d, w2d, EXPERTS, TOPK, sh.RI, rip)
 
     d = {
         n: v.cuda()
@@ -1352,7 +1362,7 @@ def test_moe(harness, rows, routing, codec):
     mpart2 = torch.zeros(rows * SLOTS, HIDDEN, device="cuda")
     flags = torch.zeros(rows * SLOTS, dtype=torch.int32, device="cuda")
     harness.mbox_t.zero_()
-    _moe_kernel(rows, codec)(
+    _moe_kernel(sh, rows, codec)(
         *[d[n].data_ptr() for n in ("x", "w_gate", "w13", "w13s", "w2", "w2s")],
         part.data_ptr(),
         route.data_ptr(),
@@ -1440,12 +1450,14 @@ def small_moe_weights():
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
         E_ALL,
         HIDDEN,
-        RI,
+        shard,
     )
 
+    sh = shard(2)
+    rip = RIP[sh.TP]
     gen = torch.Generator().manual_seed(5)
-    w13, w13s, w13d = _lazy_expert_weights(gen, E_ALL, 2 * RIP, HIDDEN, RI, HIDDEN)
-    w2, w2s, w2d = _lazy_expert_weights(gen, E_ALL, HIDDEN, RIP, HIDDEN, RI)
+    w13, w13s, w13d = _lazy_expert_weights(gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN)
+    w2, w2s, w2d = _lazy_expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
     dev = {n: v.cuda() for n, v in dict(w13=w13, w13s=w13s, w2=w2, w2s=w2s).items()}
     return dev, w13d, w2d
 
@@ -1481,12 +1493,13 @@ def test_moe_small(harness, small_moe_weights, rows, routing, codec):
         E_ALL,
         EXPERTS,
         HIDDEN,
-        RI,
         SLOTS,
         TOPK,
+        shard,
     )
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import moe
 
+    sh = shard(2)
     assert moe.small(rows)
     dev, w13d, w2d = small_moe_weights
     gen = torch.Generator().manual_seed(rows)
@@ -1511,7 +1524,7 @@ def test_moe_small(harness, small_moe_weights, rows, routing, codec):
         x, w_gate = _routed_inputs(gen, rows, picks)
         if idle:
             x[rows - idle :] = 0
-    y_r, ids_r, ws_r = ref.moe(x, w_gate, w13d, w2d, EXPERTS, TOPK, RI, RIP)
+    y_r, ids_r, ws_r = ref.moe(x, w_gate, w13d, w2d, EXPERTS, TOPK, sh.RI, RIP[sh.TP])
 
     part = torch.zeros(moe.router_plan().partial_words(rows), device="cuda")
     route = torch.zeros(2 * rows * SLOTS, dtype=torch.int32, device="cuda")
@@ -1521,7 +1534,7 @@ def test_moe_small(harness, small_moe_weights, rows, routing, codec):
     mpart2 = torch.zeros(rows * SLOTS, HIDDEN, device="cuda")
     flags = torch.zeros(rows * SLOTS, dtype=torch.int32, device="cuda")
     harness.mbox_t.zero_()
-    _moe_kernel(rows, codec)(
+    _moe_kernel(sh, rows, codec)(
         x.cuda().data_ptr(),
         w_gate.cuda().data_ptr(),
         *[dev[n].data_ptr() for n in ("w13", "w13s", "w2", "w2s")],
@@ -1892,7 +1905,7 @@ def test_qsa_sparse_attention_dense(rows, spread):
         assert rel(out.float(), expect) < 1e-2
 
 
-def _qsa_proj_kernel(rows):
+def _qsa_proj_kernel(sh, rows):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
@@ -1906,14 +1919,14 @@ def _qsa_proj_kernel(rows):
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import BLOCKS, THREADS
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import qsa, tiled
 
-    chunks = max(qsa.qkv_plan().per, qsa.ix_plan().per)  # a resident unit's K slice
+    chunks = max(qsa.qkv_plan(sh).per, qsa.ix_plan().per)  # a resident unit's K slice
 
     @fx.struct
     class Smem:
         stage: fx.Array[fx.Int32, tiled.stage_words(rows, chunks), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_qsa_proj_{rows}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=f"t_qsa_proj_tp{sh.TP}_{rows}", known_block_size=[THREADS, 1, 1])
     def kern(
         x: Int64,
         w_qkv: Int64,
@@ -1931,7 +1944,7 @@ def _qsa_proj_kernel(rows):
         g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
         prologue(g)
         gemm = tiled.Gemm(sm.stage.ptr, rows, tid, chunks=chunks)
-        qsa.proj(g, gemm, w_qkv, w_ix, x, qkv, ix, part, rows)
+        qsa.proj(g, gemm, sh, w_qkv, w_ix, x, qkv, ix, part, rows)
 
     @flyc.jit
     def launch(
@@ -1961,19 +1974,20 @@ def test_qsa_proj(harness, rows):
     products rounded to bf16 once, against float64 and against torch's bf16
     GEMM (the stock `qkv_proj` / `index_qk_proj`); rows past the step
     untouched."""
-    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import HIDDEN
+    from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import HIDDEN, shard
     from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import qsa
 
+    sh = shard(2)
     gen = torch.Generator().manual_seed(rows)
     x = torch.randn(rows, HIDDEN, generator=gen).to(torch.bfloat16)
-    w_qkv = (torch.randn(qsa.QKV, HIDDEN, generator=gen) * 0.05).to(torch.bfloat16)
+    w_qkv = (torch.randn(sh.QKV, HIDDEN, generator=gen) * 0.05).to(torch.bfloat16)
     w_ix = (torch.randn(qsa.IX, HIDDEN, generator=gen) * 0.05).to(torch.bfloat16)
     dev = torch.device("cuda")
     xd, wqd, wid = x.to(dev), w_qkv.to(dev), w_ix.to(dev)
-    qkv = torch.full((rows + 1, qsa.QKV), 7.0, dtype=torch.bfloat16, device=dev)
+    qkv = torch.full((rows + 1, sh.QKV), 7.0, dtype=torch.bfloat16, device=dev)
     ix = torch.full((rows + 1, qsa.IX), 7.0, dtype=torch.bfloat16, device=dev)
-    part = torch.zeros(qsa.partial_words(rows), device=dev)
-    launch = _qsa_proj_kernel(rows)
+    part = torch.zeros(qsa.partial_words(sh, rows), device=dev)
+    launch = _qsa_proj_kernel(sh, rows)
     for _ in range(2):  # the fold counters reset themselves
         launch(
             xd.data_ptr(),

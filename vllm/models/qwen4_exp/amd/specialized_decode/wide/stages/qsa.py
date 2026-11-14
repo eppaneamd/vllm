@@ -5,7 +5,7 @@ indexer's `index_qk_proj` (both bf16, read in place) on the launch's `x`,
 as one grid phase.
 
 - `qkv`: `x @ W_qkv.T` ([q | gate] per head, then k, v: QKVParallelLinear's
-  rank shard, `QKV` rows) in `QKV_SPLITS` K slices a 64-row group,
+  rank shard, `Shard.QKV` rows) in `QKV_SPLITS` K slices a 64-row group,
   folded by the group's last arriving unit, which stores the group's bf16
   columns of `qkv_out` [rows, QKV].
 - `ix`: `x @ W_ix.T` (the replicated indexer Q heads then K, `IX` rows)
@@ -29,40 +29,37 @@ from vllm.models.qwen4_exp.amd.specialized_decode.wide.common.ops import (
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
     BLOCKS,
     HIDDEN,
-    QSA_DIM,
-    QSA_HEADS,
-    QSA_KV_HEADS,
-    TP,
+    TPS,
+    shard,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import tiled
 
 IX_HEADS, IX_DIM = 4, 128  # the indexer's query heads (one key head), dims
-QKV = (2 * QSA_HEADS + 2 * QSA_KV_HEADS) // TP * QSA_DIM  # 6656 a rank
 IX = (IX_HEADS + 1) * IX_DIM  # 640, replicated
-QKV_SPLITS = 2  # 104 row groups x 2 = 208 units
+QKV_SPLITS = {2: 2}  # by TP: 104 row groups x 2 = 208 units
 IX_SPLITS = 4  # 10 row groups x 4 = 40 units, on CTAs 208 ..
-FOLD_IX = 128  # the ix groups' first fold counter (after the qkv groups')
+FOLD_IX = {2: 128}  # by TP: the ix groups' first fold counter (after the qkv groups')
 
 
 def i32(v):
     return fx.Int32(v)
 
 
-def qkv_plan():
-    return tiled.SplitK(QKV, HIDDEN, QKV_SPLITS)
+def qkv_plan(sh):
+    return tiled.SplitK(sh.QKV, HIDDEN, QKV_SPLITS[sh.TP])
 
 
 def ix_plan():
     return tiled.SplitK(IX, HIDDEN, IX_SPLITS)
 
 
-def partial_words(rows: int) -> int:
+def partial_words(sh, rows: int) -> int:
     """f32 words of split-K partials the phase needs: qkv's, then ix's."""
-    return qkv_plan().partial_words(rows) + ix_plan().partial_words(rows)
+    return qkv_plan(sh).partial_words(rows) + ix_plan().partial_words(rows)
 
 
-assert qkv_plan().units + ix_plan().units <= BLOCKS
-assert qkv_plan().groups <= FOLD_IX
+assert all(qkv_plan(shard(tp)).units + ix_plan().units <= BLOCKS for tp in TPS)
+assert all(qkv_plan(shard(tp)).groups <= FOLD_IX[tp] for tp in TPS)
 
 
 @traced
@@ -88,18 +85,18 @@ def _store_bf16(out, cols: int, rows: int):
 
 
 @traced
-def proj(g, gemm, w_qkv, w_ix, x, qkv_out, ix_out, part, rows: int):
+def proj(g, gemm, sh, w_qkv, w_ix, x, qkv_out, ix_out, part, rows: int):
     """Both projections of the step's `rows` rows of `x` [rows, HIDDEN]
     bf16 (written earlier in the launch); `part`: the scratch's partials."""
     source = tiled.Source(x, HIDDEN)
-    plan = qkv_plan()
-    epi, after = tiled.fold(g, gemm, plan, part, 0, _store_bf16(qkv_out, QKV, rows))
+    plan = qkv_plan(sh)
+    epi, after = tiled.fold(g, gemm, plan, part, 0, _store_bf16(qkv_out, sh.QKV, rows))
     tiled.gemm_units(
         g.bid,
         BLOCKS,
         gemm,
         source,
-        tiled.Bf16Weights(w_qkv, QKV, HIDDEN),
+        tiled.Bf16Weights(w_qkv, sh.QKV, HIDDEN),
         plan,
         epi,
         after,
@@ -107,7 +104,7 @@ def proj(g, gemm, w_qkv, w_ix, x, qkv_out, ix_out, part, rows: int):
     iplan = ix_plan()
     ipart = fx.Int64(part) + fx.Int64(plan.partial_words(rows) * 4)
     iepi, iafter = tiled.fold(
-        g, gemm, iplan, ipart, FOLD_IX, _store_bf16(ix_out, IX, rows)
+        g, gemm, iplan, ipart, FOLD_IX[sh.TP], _store_bf16(ix_out, IX, rows)
     )
     weights = tiled.Bf16Weights(w_ix, IX, HIDDEN)
     for unit in range(g.bid - i32(plan.units), i32(iplan.units), i32(BLOCKS)):

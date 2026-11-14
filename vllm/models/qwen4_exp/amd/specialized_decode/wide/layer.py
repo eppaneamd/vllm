@@ -52,10 +52,9 @@ from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
     HIDDEN,
     LOWRANK,
     MAX_TOKENS,
-    QSA_CORE,
     SLOTS,
     THREADS,
-    VALUE_DIM,
+    shard,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import exchange as ex_
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import (
@@ -90,8 +89,9 @@ class LayerBuild:
             raise ValueError(f"layer kind {self.kind!r}")
         if self.allreduce not in ex_.CODECS:
             raise ValueError(f"all-reduce codec {self.allreduce!r}")
-        if not 1 <= self.tokens <= MAX_TOKENS:
-            raise ValueError(f"{self.tokens} rows: 1 to {MAX_TOKENS}")
+        cap = shard(self.tp).MAX_TOKENS
+        if not 1 <= self.tokens <= cap:
+            raise ValueError(f"{self.tokens} rows at TP{self.tp}: 1 to {cap}")
 
 
 ABI = KernelAbi(
@@ -174,33 +174,33 @@ def phase_names(key) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def _part_words(rows: int) -> int:
+def _part_words(sh, rows: int) -> int:
     plans = [
         hc.down_plan(rows),
-        gdn.proj_plan(),
-        gdn.out_plan(),
-        gdn.out_plan(QSA_CORE),
+        gdn.proj_plan(sh),
+        gdn.out_plan(sh.VALUE_DIM),
+        gdn.out_plan(sh.QSA_CORE),
         moe.router_plan(),
     ]
     return max(p.partial_words(rows) for p in plans)
 
 
-def _resident_chunks() -> int:
+def _resident_chunks(sh) -> int:
     """K chunks of the longest GEMM unit, which a resident stage holds."""
     plans = [
         hc.down_plan(1),
-        gdn.proj_plan(),
-        gdn.ba_plan(),
-        gdn.out_plan(),
-        gdn.out_plan(QSA_CORE),
+        gdn.proj_plan(sh),
+        gdn.ba_plan(sh),
+        gdn.out_plan(sh.VALUE_DIM),
+        gdn.out_plan(sh.QSA_CORE),
         moe.router_plan(),
-        qsa_.qkv_plan(),
+        qsa_.qkv_plan(sh),
         qsa_.ix_plan(),
     ]
     return max([p.per for p in plans] + [hc.UP_CHUNKS])
 
 
-def scratch_layout(rows: int) -> dict[str, tuple[int, int]]:
+def scratch_layout(sh, rows: int) -> dict[str, tuple[int, int]]:
     """Name -> (byte offset, bytes) of a width's scratch, 256-byte aligned.
     `split` (the MoE's split-unit marks) comes first and is sized for the
     widest step, so every width's marks share one zeroed region that nothing
@@ -211,11 +211,11 @@ def scratch_layout(rows: int) -> dict[str, tuple[int, int]]:
         "inj_a": rows * HC * 4,
         "inj_m": rows * HC * 4,
         "down": rows * LOWRANK * 2,
-        "qkv": gdn.handoff_words(rows)[0] * 4,
-        "z": rows * VALUE_DIM * 2,
-        "ba": gdn.handoff_words(rows)[1] * 4,
-        "core": gdn.handoff_words(rows)[2] * 4,
-        "part": _part_words(rows) * 4,
+        "qkv": gdn.handoff_words(sh, rows)[0] * 4,
+        "z": rows * sh.VALUE_DIM * 2,
+        "ba": gdn.handoff_words(sh, rows)[1] * 4,
+        "core": gdn.handoff_words(sh, rows)[2] * 4,
+        "part": _part_words(sh, rows) * 4,
         "route": 2 * rows * SLOTS * 4,
         "x4": rows * HIDDEN // 8 * 4,
         "x4s": rows * HIDDEN // 32 * 4,
@@ -231,8 +231,8 @@ def scratch_layout(rows: int) -> dict[str, tuple[int, int]]:
     return out
 
 
-def scratch_bytes(rows: int) -> int:
-    return max(o + n for o, n in scratch_layout(rows).values())
+def scratch_bytes(sh, rows: int) -> int:
+    return max(o + n for o, n in scratch_layout(sh, rows).values())
 
 
 class Scratch(TraceInvariant):
@@ -256,8 +256,8 @@ class Scratch(TraceInvariant):
     mixp: fx.Int64
     mixd: fx.Int64
 
-    def __init__(self, base, rows: int):
-        for name, (off, _) in scratch_layout(rows).items():
+    def __init__(self, base, sh, rows: int):
+        for name, (off, _) in scratch_layout(sh, rows).items():
             setattr(self, name, fx.Int64(base) + fx.Int64(off))
 
 
@@ -273,10 +273,11 @@ def build(key: LayerBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     S, tp = key.tokens, key.tp
-    shape = moe.Shape(S, key.rip)
+    sh = shard(tp)
+    shape = moe.Shape(S, key.rip, sh.RI)
     MoeLds = moe.lds_struct(shape)
     aux_words = max(hc.up_lds_words(S), ex_.GroupTile.words(S), gdn.recur_lds_words())
-    chunks = _resident_chunks()
+    chunks = _resident_chunks(sh)
 
     @fx.struct
     class GemmLds:
@@ -293,8 +294,8 @@ def build(key: LayerBuild):
         word: fx.Array[fx.Int32, 4, 16]
 
     if key.kind == "qsa_front":
-        part_bytes = scratch_layout(S)["part"][1]
-        assert qsa_.partial_words(S) * 4 <= part_bytes, "qsa_proj partials"
+        part_bytes = scratch_layout(sh, S)["part"][1]
+        assert qsa_.partial_words(sh, S) * 4 <= part_bytes, "qsa_proj partials"
     keyed = key_tuple(key)
     name = f"q4w_{key.kind}_s{S}_tp{tp}" + ("_st" if key.stats else "")
     name += "" if key.allreduce == "bf16" else f"_{key.allreduce}"
@@ -355,7 +356,7 @@ def build(key: LayerBuild):
         gl, ml = ph.gemm.peek(), ph.moe.peek()
         g = Grid(tid, bid, sync, sync_next, folds, health, alarm, sm.word.ptr)
         prologue(g)
-        scr = Scratch(scratch, S)
+        scr = Scratch(scratch, sh, S)
         aux_f32 = fx.recast_iter(fx.Float32, gl.aux.ptr)
         gemm = tiled.Gemm(gl.stage.ptr, S, tid, chunks=chunks)
         up_gemm = tiled.Gemm(gl.stage.ptr, S, tid, k_total=LOWRANK, chunks=chunks)
@@ -488,11 +489,12 @@ def build(key: LayerBuild):
             down_w = issued if tiled.resident(S) else pre_attn
         if const_expr(key.kind == "qsa_front"):
             mix("attn", ATTN, a_norm, a_di, a_up, scr.inj_a, down_w)
-            qsa_.proj(g, gemm, w_qkv, w_ix, x, qkv_out, ix_out, scr.part, S)
+            qsa_.proj(g, gemm, sh, w_qkv, w_ix, x, qkv_out, ix_out, scr.part, S)
             if const_expr(key.trace):
                 end_phase("qsa_proj")
         if const_expr(key.kind == "gdn"):
             w = gdn.Bufs(
+                **sh._asdict(),
                 qkvz=w_qkvz,
                 qkvz_s=w_qkvz_s,
                 shuffled=key.qkvz_shuffled,
@@ -503,6 +505,7 @@ def build(key: LayerBuild):
                 norm=gdn_norm,
             )
             b = gdn.Bufs(
+                **sh._asdict(),
                 x=x,
                 qkv=scr.qkv,
                 z=scr.z,
@@ -524,10 +527,10 @@ def build(key: LayerBuild):
                 scr.inj_a,
                 down_w,
                 lambda: gdn.proj_issue(g, w),
-                (gdn.proj_weights(w), gdn.proj_plan()),
+                (gdn.proj_weights(w), gdn.proj_plan(sh)),
             )
             out_w = tiled.Fp4Weights(
-                w_out, w_out_s, HIDDEN, VALUE_DIM, key.out_shuffled
+                w_out, w_out_s, HIDDEN, sh.VALUE_DIM, key.out_shuffled
             )
             if const_expr(tiled.resident(S)):
                 # one phase: the recurrence polls the projection's tagged
@@ -535,24 +538,25 @@ def build(key: LayerBuild):
                 # before the recurrence, to land under it)
                 gtag = ep * 128 + layer * 2 + 1
                 gdn.proj(g, gemm, w, b, S, 0, proj_w, gtag)
-                pending = tiled.issue_unit(bid, tid, out_w, gdn.out_plan())
+                pending = tiled.issue_unit(bid, tid, out_w, gdn.out_plan(sh.VALUE_DIM))
                 gdn.recur(g, w, b, aux_f32, S, key.gdn_eps, None, gtag)
-                source = tagged.Pairs(g, scr.core, VALUE_DIM, gtag)
+                source = tagged.Pairs(g, scr.core, sh.VALUE_DIM, gtag)
                 name = "gdn+out+allreduce+combine"
             else:
                 gdn.proj(g, gemm, w, b, S, 0, proj_w)
                 end_phase("gdn_proj+conv")
-                pending = ahead(out_w, gdn.out_plan())  # lands under the recurrence
+                # lands under the recurrence
+                pending = ahead(out_w, gdn.out_plan(sh.VALUE_DIM))
                 gdn.recur(g, w, b, aux_f32, S, key.gdn_eps)
                 end_phase("gdn_recur")
-                source = tiled.Source(scr.core, VALUE_DIM)  # type: ignore[assignment]
+                source = tiled.Source(scr.core, sh.VALUE_DIM)  # type: ignore[assignment]
                 name = "out+allreduce+combine"
-            mlp_half(back(out_w, source, VALUE_DIM, pending, name))
+            mlp_half(back(out_w, source, sh.VALUE_DIM, pending, name))
         if const_expr(key.kind == "qsa_back"):
             pending = back(
-                tiled.Bf16Weights(w_out, HIDDEN, QSA_CORE),
-                gdn.GatedCore(attn, gate, QSA_CORE),
-                QSA_CORE,
+                tiled.Bf16Weights(w_out, HIDDEN, sh.QSA_CORE),
+                gdn.GatedCore(attn, gate, sh.QSA_CORE),
+                sh.QSA_CORE,
             )
             mlp_half(pending)
         if const_expr(key.trace):

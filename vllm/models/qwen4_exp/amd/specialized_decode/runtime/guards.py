@@ -91,7 +91,7 @@ def _compact(idx: list[int]) -> str:
     return ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs)
 
 
-def _layer_reasons(layer) -> list[str]:
+def _layer_reasons(layer, sh) -> list[str]:
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
     from vllm.models.qwen4_exp.amd.model import Qwen4ExpSparseMoeBlock
     from vllm.models.qwen4_exp.amd.qsa import Qwen4ExpQSAAttention
@@ -112,7 +112,7 @@ def _layer_reasons(layer) -> list[str]:
             out.append(f"routed experts on {backend}, not AITER_MXFP4_MXFP4")
         elif not getattr(ex.w13_weight, "is_shuffled", False):
             out.append("routed experts not shuffled")
-        elif rip % 128 or rip < L.RI:
+        elif rip % 128 or rip < sh.RI:
             out.append(f"expert intermediate padded to {rip}")
         elif tuple(ex.w13_weight.shape) != (L.E_ALL, 2 * rip, L.HIDDEN // 2):
             out.append(f"w13 {tuple(ex.w13_weight.shape)}")
@@ -154,8 +154,8 @@ def _layer_reasons(layer) -> list[str]:
         ):
             out.append("GDN layer variant")
         else:
-            out += _fp4_reasons("in_proj_qkvz", a.in_proj_qkvz, L.QKVZ, L.HIDDEN)
-            out += _fp4_reasons("out_proj", a.out_proj, L.HIDDEN, L.VALUE_DIM)
+            out += _fp4_reasons("in_proj_qkvz", a.in_proj_qkvz, sh.QKVZ, L.HIDDEN)
+            out += _fp4_reasons("out_proj", a.out_proj, L.HIDDEN, sh.VALUE_DIM)
             dense |= {
                 "in_proj_ba": a.in_proj_ba.weight,
                 "conv1d": a.conv1d.weight,
@@ -168,14 +168,14 @@ def _layer_reasons(layer) -> list[str]:
         a = layer.self_attn
         if not isinstance(a, Qwen4ExpQSAAttention):
             out.append("attention without the QSA indexer")
-        elif a.num_heads * a.head_dim != L.QSA_CORE:
+        elif a.num_heads * a.head_dim != sh.QSA_CORE:
             out.append(f"attention width {a.num_heads * a.head_dim}")
         elif not a.attn_output_gate or not a.use_fused_qsa_prepare:
             out.append("attention without the fused prepare and output gate")
         dense["o_proj"] = a.o_proj.weight
         # qsa_front projects x through both in place, [rows, HIDDEN] row-major
         for name, linear, rows in (
-            ("qkv_proj", a.qkv_proj, qsa.QKV),
+            ("qkv_proj", a.qkv_proj, sh.QKV),
             ("index_qk_proj", a.indexer.index_qk_proj, qsa.IX),
         ):
             w = linear.weight
@@ -192,9 +192,10 @@ def _layer_reasons(layer) -> list[str]:
 
 def model_reasons(model, tp: int) -> list[str]:
     """Every reason the kernels cannot serve the loaded `Qwen4ExpModel`."""
+    if tp not in L.TPS:
+        return [f"TP {tp}"]
+    sh = L.shard(tp)
     reasons = []
-    if tp != L.TP:
-        reasons.append(f"TP {tp}")
     if model.start_layer != 0 or model.end_layer != len(model.layers):
         reasons.append("partial layers")
     mixer = model.hyper_connection_mixer
@@ -208,7 +209,7 @@ def model_reasons(model, tp: int) -> list[str]:
         reasons.append(f"experts padded differently by layer: {sorted(rips)}")
     by_reason: dict[str, list[int]] = {}
     for layer in model.layers:
-        for why in _layer_reasons(layer):
+        for why in _layer_reasons(layer, sh):
             by_reason.setdefault(why, []).append(layer.layer_idx)
     reasons += [f"{why} (layers {_compact(idx)})" for why, idx in by_reason.items()]
     return reasons
@@ -216,6 +217,7 @@ def model_reasons(model, tp: int) -> list[str]:
 
 def cache_reasons(model, tp: int) -> list[str]:
     """Every reason the kernels cannot update the GDN states vLLM bound."""
+    sh = L.shard(tp)
     by_reason: dict[str, list[int]] = {}
     if is_conv_state_dim_first():
         return ["conv states stored dim-first"]
@@ -226,22 +228,22 @@ def cache_reasons(model, tp: int) -> list[str]:
         why = []
         if (
             conv_state.dtype != torch.bfloat16
-            or tuple(conv_state.shape[1:]) != (L.CONV_TAPS - 1, L.CONV_DIM)
-            or tuple(conv_state.stride()[1:]) != (L.CONV_DIM, 1)
+            or tuple(conv_state.shape[1:]) != (L.CONV_TAPS - 1, sh.CONV_DIM)
+            or tuple(conv_state.stride()[1:]) != (sh.CONV_DIM, 1)
         ):
             why.append(
                 f"conv state {conv_state.dtype} {tuple(conv_state.shape[1:])} "
                 f"{tuple(conv_state.stride()[1:])}, needs bf16 dense "
-                f"({L.CONV_TAPS - 1}, {L.CONV_DIM})"
+                f"({L.CONV_TAPS - 1}, {sh.CONV_DIM})"
             )
         if (
             rstate.dtype != torch.float32
-            or tuple(rstate.shape[1:]) != (L.NV, L.GDN_DV, L.GDN_DK)
+            or tuple(rstate.shape[1:]) != (sh.NV, L.GDN_DV, L.GDN_DK)
             or not rstate[0].is_contiguous()
         ):
             why.append(
                 f"recurrent state {rstate.dtype} {tuple(rstate.shape[1:])}, needs "
-                f"dense fp32 ({L.NV}, {L.GDN_DV}, {L.GDN_DK})"
+                f"dense fp32 ({sh.NV}, {L.GDN_DV}, {L.GDN_DK})"
             )
         for w in why:
             by_reason.setdefault(w, []).append(layer.layer_idx)

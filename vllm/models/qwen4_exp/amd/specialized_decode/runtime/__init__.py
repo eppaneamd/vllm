@@ -80,10 +80,11 @@ def unsupported(vllm_config) -> list[str]:
         vllm_config.cache_config,
     )
     oc = vllm_config.offload_config
+    tps = " or ".join(f"TP{tp}" for tp in L.TPS)
     checks = (
         (
-            pc.tensor_parallel_size != L.TP,
-            f"TP {pc.tensor_parallel_size} (TP{L.TP} only)",
+            pc.tensor_parallel_size not in L.TPS,
+            f"TP {pc.tensor_parallel_size} ({tps} only)",
         ),
         (pc.pipeline_parallel_size != 1, "pipeline parallelism"),
         (pc.data_parallel_size != 1, "data parallelism"),

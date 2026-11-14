@@ -65,25 +65,20 @@ from vllm.models.qwen4_exp.amd.specialized_decode.wide.common.ops import (
     zeros,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
-    BA,
     BLOCKS,
-    CONV_DIM,
     GDN_DK,
     GDN_DV,
+    GDN_NK,
+    GDN_NV,
     HIDDEN,
-    KEY_DIM,
-    NK,
-    NV,
-    QKVZ,
-    VALUE_DIM,
 )
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import exchange as ex_
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import tagged, tiled
 
-PROJ_SPLITS = 2  # 128 row groups x 2 = 256 units
+PROJ_SPLITS = {2: 2}  # by TP: 128 row groups x 2 = 256 units
 BA_SPLITS = HIDDEN // tiled.CHUNK  # one chunk a unit, summed by the recurrence
 OUT_SPLITS = 6  # 40 column groups x 6 = 240 units
-HEADS_PER_K = NV // NK  # value heads a key head serves
+HEADS_PER_K = GDN_NV // GDN_NK  # value heads a key head serves
 HALF = GDN_DK // 2  # key elements a thread holds
 L2_EPS = 1e-6  # the in-kernel q / k L2 norm's
 # widths past tiled.RESIDENT_MAX up to which a projection group's conv loads
@@ -92,15 +87,15 @@ L2_EPS = 1e-6  # the in-kernel q / k L2 norm's
 CONV_LATE_ROWS = 48
 
 
-def proj_plan():
-    return tiled.SplitK(QKVZ, HIDDEN, PROJ_SPLITS)
+def proj_plan(sh):
+    return tiled.SplitK(sh.QKVZ, HIDDEN, PROJ_SPLITS[sh.TP])
 
 
-def ba_plan():
-    return tiled.SplitK(BA, HIDDEN, BA_SPLITS)
+def ba_plan(sh):
+    return tiled.SplitK(sh.BA, HIDDEN, BA_SPLITS)
 
 
-def out_plan(k: int = VALUE_DIM):
+def out_plan(k: int):
     return tiled.SplitK(HIDDEN, k, OUT_SPLITS)
 
 
@@ -113,7 +108,9 @@ def _halves(word):
 
 
 class Bufs(TraceInvariant):
-    """Named addresses (Int64) and trace-time constants of a launch."""
+    """Named addresses (Int64) and trace-time constants of a launch, among them
+    the rank's sizes (`layout.Shard`'s fields, `b.NV`): a `Bufs` stands in where
+    a function takes the `Shard` (`proj_plan(b)`)."""
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -127,21 +124,29 @@ class Bufs(TraceInvariant):
 # --------------------------------------------------------------------------
 
 
-def handoff_words(rows: int) -> tuple[int, int, int]:
+def handoff_words(sh, rows: int) -> tuple[int, int, int]:
     """i32 words of the `qkv`, `ba` and `core` buffers: plain, or at the
     resident widths tagged pairs (`[rows, QKVZ / 2]` bf16 pairs, the
     partials' f32 values, `[rows, VALUE_DIM / 2]` bf16 pairs)."""
     if tiled.resident(rows):
-        return rows * QKVZ, 2 * ba_plan().partial_words(rows), rows * VALUE_DIM
-    return rows * CONV_DIM // 2, ba_plan().partial_words(rows), rows * VALUE_DIM // 2
+        return (
+            rows * sh.QKVZ,
+            2 * ba_plan(sh).partial_words(rows),
+            rows * sh.VALUE_DIM,
+        )
+    return (
+        rows * sh.CONV_DIM // 2,
+        ba_plan(sh).partial_words(rows),
+        rows * sh.VALUE_DIM // 2,
+    )
 
 
 def proj_weights(w):
-    return tiled.Fp4Weights(w.qkvz, w.qkvz_s, QKVZ, HIDDEN, w.shuffled)
+    return tiled.Fp4Weights(w.qkvz, w.qkvz_s, w.QKVZ, HIDDEN, w.shuffled)
 
 
 def ba_weights(w):
-    return tiled.Bf16Weights(w.ba, BA, HIDDEN)
+    return tiled.Bf16Weights(w.ba, w.BA, HIDDEN)
 
 
 def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
@@ -161,7 +166,7 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
     recurrence polls, with no grid barrier between: `qkv` holds `[rows,
     QKVZ / 2]` (bf16 pair, tag) pairs, z included, `ba` the partials'
     (value, tag) pairs."""
-    plan = proj_plan()
+    plan = proj_plan(b)
     source = tiled.Source(b.x, HIDDEN)
     if not gemm.resident:
         _proj_streamed(g, gemm, w, b, rows, fold0, pending, plan, source)
@@ -175,7 +180,7 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
         raise ValueError("the [b | a] chunks ride on one projection unit a CTA")
     loads, ba_loads = (None, None) if pending is None else pending
     bw = ba_weights(w)
-    bplan = ba_plan()
+    bplan = ba_plan(b)
     if tag is None:
         ba_epi = tiled.partial_epilogue(gemm, bplan, b.ba)
     else:
@@ -224,7 +229,7 @@ def _proj_streamed(g, gemm, w, b, rows: int, fold0: int, pending, plan, source):
 
     def stage(first, lane):
         # a z row reads the last conv rows' and uses nothing
-        row = fx.min(first + lane // 16 * 4, i32(CONV_DIM - 4))
+        row = fx.min(first + lane // 16 * 4, i32(b.CONV_DIM - 4))
         staged[:] = [conv_loads(w, b, row, tokens, slots)]
 
     def begin(group, first, lane):
@@ -234,7 +239,7 @@ def _proj_streamed(g, gemm, w, b, rows: int, fold0: int, pending, plan, source):
         row = first + lane // 16 * 4
         conv_rows(w, b, rows, row, lane, acc, gemm.tiles, loads=staged[0])
 
-    bplan = ba_plan()
+    bplan = ba_plan(b)
     bw = ba_weights(w)
     ba_epilogue = tiled.partial_epilogue(gemm, bplan, b.ba)
 
@@ -295,7 +300,7 @@ def proj_issue(g, w):
     """The first unit's weights of `proj` at the resident widths, in flight:
     its input projection chunks and its [b | a] chunk (a unit without one
     loads the last chunk's and drops them)."""
-    plan = proj_plan()
+    plan = proj_plan(w)
     unit = (g.bid < i32(plan.units)).select(g.bid, i32(plan.units - 1))
     c = unit // plan.groups * plan.per + unit % plan.groups
     c = (c < BA_SPLITS).select(c, i32(BA_SPLITS - 1))
@@ -336,7 +341,7 @@ def conv_loads(w, b, row, tokens, slots=None):
         for t in range(len(tokens))
     ]
     states = [
-        [gld(sbs[t] + fx.Int64(jj * CONV_DIM * 2), fx.Int32, 2) for jj in range(3)]
+        [gld(sbs[t] + fx.Int64(jj * b.CONV_DIM * 2), fx.Int32, 2) for jj in range(3)]
         for t in range(len(tokens))
     ]
     return words, live, sbs, states
@@ -353,7 +358,7 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
     nothing. With `tag` q | k | v and z are stored as tagged pairs
     (`proj`)."""
     tokens, valid = _conv_tokens(rows, lane, tiles)
-    if row < CONV_DIM:
+    if row < b.CONV_DIM:
         if const_expr(loads is None):
             words, live, sbs, states = conv_loads(w, b, row, tokens)
         else:
@@ -387,15 +392,15 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
                     .bitcast(fx.Int32)
                 )
                 if const_expr(tag is None):
-                    st(b.qkv, (tokens[t] * CONV_DIM + row) // 2, packed, CM_DEV)
+                    st(b.qkv, (tokens[t] * b.CONV_DIM + row) // 2, packed, CM_DEV)
                 else:
-                    at = (tokens[t] * QKVZ + row) // 2
+                    at = (tokens[t] * b.QKVZ + row) // 2
                     tagged.put(b.qkv, at, [packed[0], packed[1]], tag)
                 if live[t]:
                     gst(sbs[t], s[1])
-                    gst(sbs[t] + fx.Int64(CONV_DIM * 2), s[2])
+                    gst(sbs[t] + fx.Int64(b.CONV_DIM * 2), s[2])
                     gst(
-                        sbs[t] + fx.Int64(2 * CONV_DIM * 2),
+                        sbs[t] + fx.Int64(2 * b.CONV_DIM * 2),
                         fx.Vector.from_elements(xs, fx.Float32)
                         .to(fx.BFloat16)
                         .bitcast(fx.Int32),
@@ -406,10 +411,10 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
                 v = fx.Vector.from_elements([acc[t][e] for e in range(4)], fx.Float32)
                 packed = v.to(fx.BFloat16).bitcast(fx.Int32)
                 if const_expr(tag is None):
-                    at = (tokens[t] * VALUE_DIM + row - CONV_DIM) // 2
+                    at = (tokens[t] * b.VALUE_DIM + row - b.CONV_DIM) // 2
                     st(b.z, at, packed, CM_DEV)
                 else:
-                    at = (tokens[t] * QKVZ + row) // 2
+                    at = (tokens[t] * b.QKVZ + row) // 2
                     tagged.put(b.qkv, at, [packed[0], packed[1]], tag)
 
 
@@ -459,7 +464,7 @@ def recur_first(g, b, rows: int):
     """The state loads of the CTA's first unit at the resident widths. No phase
     of the launch writes them before the recurrence, so they may be issued
     ahead (inside the barrier before it)."""
-    units = rows * NV
+    units = rows * b.NV
     unit = (g.bid < i32(units)).select(g.bid, i32(units - 1))
     return load_head(b, unit, _state_offsets(g))
 
@@ -467,7 +472,7 @@ def recur_first(g, b, rows: int):
 def load_head(b, unit, at):
     """This thread's 16 state quads of value head `unit % NV` of row `unit //
     NV`."""
-    row, vh = unit // NV, unit % NV
+    row, vh = unit // b.NV, unit % b.NV
     slot = uniform(ld(b.st_idx, row, fx.Int32, cm=CM_DEV))
     hb = state_base(b, slot, vh // HEADS_PER_K) + fx.Int64(vh % HEADS_PER_K) * fx.Int64(
         HEAD_BYTES
@@ -481,13 +486,13 @@ def _recur_heads(g, w, b, lds, rows: int, eps: float, h, tag):
     k0 = kq * 4
     rp = g.lane // 32
     at = _state_offsets(g)
-    units = rows * NV
+    units = rows * b.NV
     vmine = (kq // 2) * 8 + g.wave * 2 + rp
     nw = bf_lo(ld(w.norm, vmine // 2, fx.Int32) >> ((vmine % 2) * 16))
     if const_expr(h is None):
         h = recur_first(g, b, rows)
     for unit in range(g.bid, units, BLOCKS):
-        row, vh = unit // NV, unit % NV
+        row, vh = unit // b.NV, unit % b.NV
         kh, i = vh // HEADS_PER_K, vh % HEADS_PER_K
         slot = uniform(ld(b.st_idx, row, fx.Int32, cm=CM_DEV))
         stage_tagged(g, w, b, lds, rows, row, kh, tag)
@@ -499,7 +504,7 @@ def _recur_heads(g, w, b, lds, rows: int, eps: float, h, tag):
             head(g, b, nw, h, hb, at, q, k, lds, i, row, vh, rp, kq, eps, tag)
         else:
             if g.tid < GDN_DV // 2:
-                at0 = (row * VALUE_DIM + vh * GDN_DV) // 2 + g.tid
+                at0 = (row * b.VALUE_DIM + vh * GDN_DV) // 2 + g.tid
                 tagged.put(b.core, at0, [i32(0)], tag)
         h = nxt
         fx.barrier()
@@ -511,13 +516,13 @@ def _recur(g, w, b, lds, rows: int, eps: float):
     k0 = kq * 4
     rp = g.lane // 32
     at = _state_offsets(g)
-    units = rows * NK
+    units = rows * b.NK
     # the norm weight of the one row each lane stores (``head``)
     vmine = (kq // 2) * 8 + g.wave * 2 + rp
     nw = bf_lo(ld(w.norm, vmine // 2, fx.Int32) >> ((vmine % 2) * 16))
     h = load_heads(g, b, g.bid, at, 0)
     for unit in range(g.bid, units, BLOCKS):
-        row, kh = unit // NK, unit % NK
+        row, kh = unit // b.NK, unit % b.NK
         slot = uniform(ld(b.st_idx, row, fx.Int32, cm=CM_DEV))
         stage_unit(g, w, b, lds, rows, row, kh)
         q = lds_ld(lds + Q_AT + k0, 4, fx.Float32)
@@ -556,7 +561,7 @@ def _recur(g, w, b, lds, rows: int, eps: float):
                 if g.tid < GDN_DV // 2:
                     st(
                         b.core,
-                        (row * VALUE_DIM + (kh * HEADS_PER_K + i) * GDN_DV) // 2
+                        (row * b.VALUE_DIM + (kh * HEADS_PER_K + i) * GDN_DV) // 2
                         + g.tid,
                         fx.Int32(0),
                         CM_DEV,
@@ -595,7 +600,7 @@ def state_base(b, slot, kh):
 
 def load_heads(g, b, unit, at, i: int):
     """This thread's 16 state quads of head `i` of `unit`."""
-    row, kh = unit // NK, unit % NK
+    row, kh = unit // b.NK, unit % b.NK
     slot = uniform(ld(b.st_idx, row, fx.Int32, cm=CM_DEV))
     hb = state_base(b, slot, kh) + fx.Int64(i * HEAD_BYTES)
     return [ld(hb, a, fx.Float32, 4, cm=CM_NT) for a in at]
@@ -606,13 +611,13 @@ def stage_unit(g, w, b, lds, rows: int, row, kh):
     """q, k (L2-normalized, q scaled), v and z of the unit's 3 heads, and their
     gates (beta, decay: the [b | a] split partials summed in order, rounded to
     bf16) into LDS."""
-    bplan = ba_plan()
-    base = row * CONV_DIM
+    bplan = ba_plan(b)
+    base = row * b.CONV_DIM
     scale = fx.Float32(1.0 / math.sqrt(GDN_DK))
     if g.tid < 64:  # q | k, four elements a thread
         src = (g.tid < 32).select(
             base + kh * GDN_DK + g.tid * 4,
-            base + KEY_DIM + kh * GDN_DK + (g.tid - 32) * 4,
+            base + b.KEY_DIM + kh * GDN_DK + (g.tid - 32) * 4,
         )
         wv = ld(b.qkv, src // 2, fx.Int32, 2, cm=CM_DEV)
         x = [bf_lo(wv[0]), bf_hi(wv[0]), bf_lo(wv[1]), bf_hi(wv[1])]
@@ -627,7 +632,7 @@ def stage_unit(g, w, b, lds, rows: int, row, kh):
             t = g.tid - 64
             wv = ld(
                 b.qkv,
-                (base + 2 * KEY_DIM + kh * 3 * GDN_DV + t * 4) // 2,
+                (base + 2 * b.KEY_DIM + kh * 3 * GDN_DV + t * 4) // 2,
                 fx.Int32,
                 2,
                 cm=CM_DEV,
@@ -642,7 +647,7 @@ def stage_unit(g, w, b, lds, rows: int, row, kh):
             t = g.tid - 160
             wv = ld(
                 b.z,
-                (row * VALUE_DIM + kh * 3 * GDN_DV + t * 4) // 2,
+                (row * b.VALUE_DIM + kh * 3 * GDN_DV + t * 4) // 2,
                 fx.Int32,
                 2,
                 cm=CM_DEV,
@@ -657,18 +662,18 @@ def stage_unit(g, w, b, lds, rows: int, row, kh):
     if g.tid < 6 * bplan.splits:
         lds_st(
             lds + P_AT + g.tid,
-            ld(b.ba, _gate_partial(g, rows, row, kh), fx.Float32, cm=CM_DEV),
+            ld(b.ba, _gate_partial(g, b, rows, row, kh), fx.Float32, cm=CM_DEV),
         )
     _gates(g, w, lds, kh)
 
 
-def _gate_partial(g, rows: int, row, kh):
+def _gate_partial(g, sh, rows: int, row, kh):
     """The [b | a] partial thread `tid < 6 splits` stages: gate `j = tid /
     splits` (beta 0..2, decay 3..5) of the key head's value heads, split
     `tid % splits`."""
-    bplan = ba_plan()
+    bplan = ba_plan(sh)
     j, s = g.tid // bplan.splits, g.tid % bplan.splits
-    r = (j < 3).select(kh * HEADS_PER_K + j, NV + kh * HEADS_PER_K + j - 3)
+    r = (j < 3).select(kh * HEADS_PER_K + j, sh.NV + kh * HEADS_PER_K + j - 3)
     return (s * rows + row) * bplan.padded + r
 
 
@@ -676,7 +681,7 @@ def _gate_partial(g, rows: int, row, kh):
 def _gates(g, w, lds, kh):
     """The gates from their staged partials (summed in split order, rounded to
     bf16) into LDS, between barriers."""
-    bplan = ba_plan()
+    bplan = ba_plan(w)
     fx.barrier()
     if g.tid < 6:
         tot = lds_ld(lds + P_AT + g.tid * bplan.splits)
@@ -695,23 +700,23 @@ def _gates(g, w, lds, kh):
 def stage_tagged(g, w, b, lds, rows: int, row, kh, tag):
     """`stage_unit` from the projection's tagged pairs (`proj`): every
     thread polls its four q | k, v or z values and its gate partial together."""
-    bplan = ba_plan()
+    bplan = ba_plan(b)
     t = g.tid
     scale = fx.Float32(1.0 / math.sqrt(GDN_DK))
     qrow = (t < 32).select(
         kh * GDN_DK + t * 4,
         (t < 64).select(
-            KEY_DIM + kh * GDN_DK + (t - 32) * 4,
+            b.KEY_DIM + kh * GDN_DK + (t - 32) * 4,
             (t < 160).select(
-                2 * KEY_DIM + kh * 3 * GDN_DV + (t - 64) * 4,
-                CONV_DIM + kh * 3 * GDN_DV + (t - 160) * 4,
+                2 * b.KEY_DIM + kh * 3 * GDN_DV + (t - 64) * 4,
+                b.CONV_DIM + kh * 3 * GDN_DV + (t - 160) * 4,
             ),
         ),
     )
     live = t < 6 * bplan.splits
-    gate_at = live.select(_gate_partial(g, rows, row, kh), i32(0))
+    gate_at = live.select(_gate_partial(g, b, rows, row, kh), i32(0))
     got = tagged.poll(
-        g, [(b.qkv, (row * QKVZ + qrow) // 2, 2), (b.ba, gate_at, 1)], tag
+        g, [(b.qkv, (row * b.QKVZ + qrow) // 2, 2), (b.ba, gate_at, 1)], tag
     )
     wv = got[0]
     x = [bf_lo(wv[0]), bf_hi(wv[0]), bf_lo(wv[1]), bf_hi(wv[1])]
@@ -807,7 +812,7 @@ def head(g, b, nw, h, hb, at, q, k, lds, i_head, row, vh, rp, kq, eps, tag=None)
             y = o * rr * nw * sigmoid(lds_ld(zl + v))
             st(
                 b.core,
-                row * VALUE_DIM + vh * GDN_DV + v,
+                row * b.VALUE_DIM + vh * GDN_DV + v,
                 fx.Float32(y).to(fx.BFloat16),
                 CM_DEV,
             )
@@ -820,7 +825,7 @@ def head(g, b, nw, h, hb, at, q, k, lds, i_head, row, vh, rp, kq, eps, tag=None)
             ys = lds_ld(lds + Y_AT + g.tid * 4, 4, fx.Float32)
             tagged.put(
                 b.core,
-                (row * VALUE_DIM + vh * GDN_DV) // 2 + g.tid * 2,
+                (row * b.VALUE_DIM + vh * GDN_DV) // 2 + g.tid * 2,
                 [pack_bf16(ys[0], ys[1]), pack_bf16(ys[2], ys[3])],
                 tag,
             )
