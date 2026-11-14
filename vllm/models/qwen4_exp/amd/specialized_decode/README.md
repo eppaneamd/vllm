@@ -1,27 +1,34 @@
 # Qwen3.8-Flash-Next specialized decode (wide)
 
-`--monokernel` on MI355X/gfx950 runs each pure decode step of 1 to 192 rows
-of Qwen3.8-Flash-Next (`amd/Qwen3.8-Flash-Next-Quark-MXFP4`) at TP2 as one
-persistent FlyDSL launch per decoder layer (`runtime/decode.py`,
-`wide/layer.py`):
+`--monokernel` on MI355X/gfx950 runs each pure decode step of 1 to 192 rows at
+TP2 or 1 to 64 rows at TP1 of Qwen3.8-Flash-Next
+(`amd/Qwen3.8-Flash-Next-Quark-MXFP4`) as one persistent FlyDSL launch per
+decoder layer (`runtime/decode.py`, `wide/layer.py`):
 
 | layer | launches | phases |
 | --- | --- | --- |
 | GDN (36) | `gdn` | [stats] attn mix, GDN projection + conv, gated delta rule + gated norm, out_proj + all-reduce + combine, MLP mix, router, routing + MXFP4 quantization, experts, MoE combine + all-reduce + combine |
-| QSA (12) | `qsa_front`, indexer, attention, `qsa_back` | attn mix → x, qkv_proj + index_qk_proj; vLLM's fused prepare, the indexer scores and the top-k select (`wide/indexer.py`, `wide/select.py`); sparse attention on the paged KV (`wide/attention.py`); gated o_proj + all-reduce + combine and the MLP half |
+| QSA (12) | `qsa_front`, indexer, attention, `qsa_back` (TP1: vLLM's QSA between the two, below) | attn mix → x, qkv_proj + index_qk_proj; vLLM's fused prepare, the indexer scores and the top-k select (`wide/indexer.py`, `wide/select.py`); sparse attention on the paged KV (`wide/attention.py`); gated o_proj + all-reduce + combine and the MLP half |
 
 The embedding, the PLE layer, the final mixer, the head and sampling stay
 vLLM's. Steps of a width without a build, prefill and mixed steps run vLLM's
 forward. The kernels are built for each of the deployment's CUDA graph capture
-sizes in 1-192; a decode step runs the smallest captured width that holds it
-(vLLM's graph padding), so capture sizes 1, 2, 4, 8, 16 serve 3 rows at width
-4 and 12 at 16.
+sizes in 1-192 (TP2) or 1-64 (TP1); a decode step runs the smallest captured
+width that holds it (vLLM's graph padding), so capture sizes 1, 2, 4, 8, 16
+serve 3 rows at width 4 and 12 at 16.
 
-To serve decode steps above 128 rows on these kernels, include capture sizes
-up to 192 (for example 136, 144, 152, 160, 168, 176, 184, 192). Every added
-size builds four layer kernels, increasing cold-start compilation time.
-Steps above 192 rows run vLLM's forward; include graph capture sizes up to
-`--max-num-seqs` to avoid uncaptured decode steps on that path.
+To serve decode steps above 128 rows on these kernels at TP2, include capture
+sizes up to 192 (for example 136, 144, 152, 160, 168, 176, 184, 192). Every
+added size builds four layer kernels, increasing cold-start compilation time.
+Steps above 192 rows (TP1: 64) run vLLM's forward; include graph capture sizes
+up to `--max-num-seqs` to avoid uncaptured decode steps on that path.
+
+At TP1 a QSA layer's indexer and attention run vLLM's own, between `qsa_front`
+and `qsa_back` (`runtime/layers.py`, `_wide_qsa`): the wide kernels need one KV
+head a rank and TP1 has two. `qsa_front`'s `index_qk_proj` units still run
+and their output goes unused, because vLLM's indexer projects its own. The TP
+exchange stays a round trip through the rank's own mailbox, to keep one kernel
+structure.
 
 The kernels are built from an expert-major fused W4A4 MoE, batch-tiled
 MFMA GEMMs with split-K folded by the last arriver, a line-based in-kernel TP
@@ -39,10 +46,10 @@ down projection's output rows and push the exchange lines.
 ## MoE schedule
 
 A unit is one expert and up to 16 of its rows; its time is one CU's stream
-of the expert's weights (~1.3 MB a rank), whatever its row count. Real
-routing is far from uniform (128 rows of natural text: ~300 distinct experts
-a layer, up to ~80 rows on one; uniform: ~470), so the schedule
-(`wide/stages/moe.py`, `experts`) adapts to the step's distribution:
+of the expert's weights (~1.3 MB a rank at TP2, ~2.6 MB at TP1), whatever
+its row count. Real routing is far from uniform (128 rows of natural text:
+~300 distinct experts a layer, up to ~80 rows on one; uniform: ~470), so the
+schedule (`wide/stages/moe.py`, `experts`) adapts to the step's distribution:
 
 - units of one expert are consecutive and run on one XCD (runs of 8 rotate
   over the XCDs), so a hot expert's weights come through one L2;
@@ -54,10 +61,10 @@ a layer, up to ~80 rows on one; uniform: ~470), so the schedule
 
 ## Supported
 
-- TP2 on dedicated, unpartitioned GPUs (256 CUs, one CTA per CU), Model
+- TP1 or TP2 on dedicated, unpartitioned GPUs (256 CUs, one CTA per CU), Model
   Runner V2, FULL CUDA graphs for decode (PIECEWISE steps run vLLM's forward);
-- pure decode of 1-192 rows (graph padding rows are inert: their GDN state
-  slot is the null block);
+- pure decode of 1-192 rows at TP2, 1-64 at TP1 (graph padding rows are inert:
+  their GDN state slot is the null block);
 - HC sequence parallelism (`--enable-hc-sp`): stock steps keep their sharded
   layout; specialized steps run every row, including the PLE, on every rank;
 - the checkpoint's shapes (`wide/layout.py`, `SHAPES`) and formats: online
@@ -72,13 +79,13 @@ a layer, up to ~80 rows on one; uniform: ~470), so the schedule
 ## Refusals
 
 Default-deny, in three stages, each reporting every reason in one error
-(`runtime/__init__.py`, `runtime/guards.py`): the config (TP other than 2,
-PP, DP, EP, EPLB, DCP, PCP, DBO, MoE sequence parallelism, LoRA, KV
+(`runtime/__init__.py`, `runtime/guards.py`): the config (TP other than 1 or
+2, PP, DP, EP, EPLB, DCP, PCP, DBO, MoE sequence parallelism, LoRA, KV
 connectors, routed-expert capture, speculative decoding, sleep mode, CPU
 weight offload, weight updates, GDN prefix caching, other GDN cache dtypes,
 an unfused shared expert, `STOCK_TORCH_COMPILE`, other model shapes, no
-capture size in 1-192, a platform other than unpartitioned gfx950); the
-loaded model (every layer's modules, quantization methods,
+capture size in 1-192 (TP1: 1-64), a platform other than unpartitioned
+gfx950); the loaded model (every layer's modules, quantization methods,
 weight layouts and shapes); the GDN caches at every bind (dtypes, shapes,
 dense slots). The TP ranks agree on every stage.
 
@@ -96,11 +103,12 @@ all-reduces): with `INT4` (or `INT3`) they send QuickReduce's INT4 codec
 (16-column groups, the group's signed extremum mapped to -8, here with a bf16
 scale so small partials do not flush to zero), 3.2x fewer bytes on the link;
 otherwise they are exact bf16 sums in rank order, as stock's custom
-all-reduce at decode sizes. Every rank decodes every rank's copy, its own
-included, so the ranks agree. The lines are one-shot: each rank quantizes
-its partial once, where QuickReduce's two-shot all-reduce quantizes twice
-(the scattered partials, then the reduced shard); at TP2 two-shot would move
-the same bytes and add a round trip.
+all-reduce at decode sizes. At TP1 they are exact bf16 whatever the setting:
+the lines only round-trip through the rank's own mailbox. Every rank decodes
+every rank's copy, its own included, so the ranks agree. The lines are
+one-shot: each rank quantizes its partial once, where QuickReduce's two-shot
+all-reduce quantizes twice (the scattered partials, then the reduced shard);
+at TP2 two-shot would move the same bytes and add a round trip.
 
 ## Failure
 
@@ -130,6 +138,7 @@ every launch with per-phase clock stamps (`Launcher.trace`,
 
 ## Toolchain
 
-FlyDSL comes in through AITER; measured with FlyDSL 0.4.0.
+FlyDSL comes in through AITER; measured with FlyDSL 0.4.0 at TP2 and 0.4.2 at
+TP1.
 `tests/models/qwen4_exp/amd_specialized_decode/` checks each stage against a
 float64 reference with the stock rounding points.

@@ -3,14 +3,15 @@
 """The gated delta net of a GDN layer (vLLM's `QwenGatedDeltaNetAttention`
 decode on one rank) as grid phases over every row of the step.
 
-- `proj`: `[q | k | v | z] = x @ W_qkvz.T` (MXFP4) in two K slices a
+- `proj`: `[q | k | v | z] = x @ W_qkvz.T` (MXFP4) in `PROJ_SPLITS` K slices a
   64-row group, folded by the group's last arriving unit, whose epilogue runs
   the causal conv on `q | k | v` with its state update:
   `silu(w0 s0 + w1 s1 + w2 s2 + w3 x)`, new state `[s1, s2, x]`, `x`
   the projection rounded to bf16 (the stock GEMM's output); `z` is stored
   as is. The `[b | a]` rows (bf16 `W_ba`) are one-chunk units
   whose partials the recurrence sums, run by the first arrivers of the
-  first groups, so no last arriver's conv waits behind one.
+  first groups, so no last arriver's conv waits behind one; at one split, which
+  has no first arriver, by the first groups' units after their fold.
 - `recur`: a unit is (row, key head), a CTA: the key head's three value
   heads in turn, each the gated delta rule on its 128 x 128 fp32 state in
   place, then the gated RMSNorm of the output (`RMSNormGated` with the
@@ -75,7 +76,7 @@ from vllm.models.qwen4_exp.amd.specialized_decode.wide.layout import (
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import exchange as ex_
 from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import tagged, tiled
 
-PROJ_SPLITS = {2: 2}  # by TP: 128 row groups x 2 = 256 units
+PROJ_SPLITS = {1: 1, 2: 2}  # by TP: 256 row groups x 1, 128 x 2 = 256 units
 BA_SPLITS = HIDDEN // tiled.CHUNK  # one chunk a unit, summed by the recurrence
 OUT_SPLITS = 6  # 40 column groups x 6 = 240 units
 HEADS_PER_K = GDN_NV // GDN_NK  # value heads a key head serves
@@ -158,10 +159,11 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
     at the resident widths `proj_issue`'s, else the CTA's
     `tiled.unit_preload` of `proj_weights`.
 
-    At the resident widths the [b | a] chunk `c` is multiplied by the unit
-    of split `c // per` and group `c % per`, whose stage holds it, before
-    the unit's fold; wider steps run it as one-chunk units on the first
-    arrivers of the projection's groups (`_proj_streamed`). With `tag`
+    At the resident widths the [b | a] chunk `c` of 64-row block `r` is
+    multiplied by the unit of split `c // per` and group `r per + c % per`,
+    whose stage holds it, before the unit's fold (`_ba_block`); wider steps
+    run it as one-chunk units on the first arrivers of the projection's groups
+    (`_proj_streamed`; at one split after the fold). With `tag`
     (resident widths) the outputs are tagged pairs (`tagged`) the
     recurrence polls, with no grid barrier between: `qkv` holds `[rows,
     QKVZ / 2]` (bf16 pair, tag) pairs, z included, `ba` the partials'
@@ -176,28 +178,31 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
         conv_rows(w, b, rows, first + lane // 16 * 4, lane, acc, gemm.tiles, tag)
 
     epilogue, after = tiled.fold(g, gemm, plan, b.part, fold0, finish)
+    bplan = ba_plan(b)
     if plan.units > BLOCKS or plan.per * plan.splits != BA_SPLITS:
         raise ValueError("the [b | a] chunks ride on one projection unit a CTA")
+    if plan.per * bplan.groups > plan.groups:
+        raise ValueError("a [b | a] row block's chunks need a projection group each")
     loads, ba_loads = (None, None) if pending is None else pending
     bw = ba_weights(w)
-    bplan = ba_plan(b)
     if tag is None:
         ba_epi = tiled.partial_epilogue(gemm, bplan, b.ba)
     else:
         ba_epi = _tagged_partials(gemm, bplan, b.ba, tag)
 
     def ba_after(group, split):
-        if group < plan.per:
-            c = split * plan.per + group
+        if group < plan.per * bplan.groups:
+            row0, chunk = _ba_block(group, plan, bplan)
+            c = split * plan.per + chunk
             got = ba_loads
             if const_expr(got is None):
-                got = _ba_issue(g, bw, c)
+                got = _ba_issue(g, bw, c, row0)
             acc = gemm.mma_tiles(
                 [[zeros(4) for _ in range(gemm.tiles)]],
                 [bw.operands(got)],
-                lambda t: gemm.operands_resident(group, plan.per, t, bw.koff),
+                lambda t: gemm.operands_resident(chunk, plan.per, t, bw.koff),
             )
-            ba_epi(c, c, g.wave * 16, gemm.lane, acc[0])
+            ba_epi(c, c, _ba_row(g, row0), gemm.lane, acc[0])
         after(group, split)
 
     tiled.gemm_units(
@@ -221,7 +226,8 @@ def _proj_streamed(g, gemm, w, b, rows: int, fold0: int, pending, plan, source):
     round trips overlap; above, every unit issues them after its partials,
     before the fold arrival, which then drains them. The `[b | a]` units run
     on the first arrivers of groups `0 ..`, which have nothing else to do in
-    the phase."""
+    the phase; at one split, which has no first arriver, on groups `0 ..`
+    after their fold."""
     tokens, _ = _conv_tokens(rows, gemm.lane, gemm.tiles)
     slots = [ld(b.st_idx, tk, fx.Int32, cm=CM_DEV) for tk in tokens]
     late = rows <= CONV_LATE_ROWS
@@ -242,15 +248,18 @@ def _proj_streamed(g, gemm, w, b, rows: int, fold0: int, pending, plan, source):
     bplan = ba_plan(b)
     bw = ba_weights(w)
     ba_epilogue = tiled.partial_epilogue(gemm, bplan, b.ba)
+    assert bplan.units <= plan.groups, (bplan.units, plan.groups)
 
     @traced
     def ba_unit(group):
-        """The [b | a] unit `group` (one chunk), on the group's first arriver."""
+        """The [b | a] unit `group` (one chunk), on the group's first arriver
+        (at one split its only unit, after the fold)."""
         if group < i32(bplan.units):
             _, split, firsts, rws = tiled.unit_rows(bplan, group, gemm.tid)
             acc = gemm.run(source, bw, rws, split * i32(bplan.per), bplan.per)
             ba_epilogue(group, split, firsts[0], gemm.lane, acc[0])
 
+    one = plan.splits == 1
     epilogue, after = tiled.fold(
         g,
         gemm,
@@ -258,7 +267,8 @@ def _proj_streamed(g, gemm, w, b, rows: int, fold0: int, pending, plan, source):
         b.part,
         fold0,
         finish,
-        other=ba_unit,
+        done=ba_unit if one else None,
+        other=None if one else ba_unit,
         begin=begin if late else None,
     )
 
@@ -298,20 +308,42 @@ def _tagged_partials(gemm, plan, part, tag):
 
 def proj_issue(g, w):
     """The first unit's weights of `proj` at the resident widths, in flight:
-    its input projection chunks and its [b | a] chunk (a unit without one
-    loads the last chunk's and drops them)."""
-    plan = proj_plan(w)
+    its input projection chunks and its [b | a] chunk, by `proj`'s group
+    mapping (`_ba_block`; a unit without one loads the last chunk's and drops
+    them)."""
+    plan, bplan = proj_plan(w), ba_plan(w)
     unit = (g.bid < i32(plan.units)).select(g.bid, i32(plan.units - 1))
-    c = unit // plan.groups * plan.per + unit % plan.groups
+    first = unit // plan.groups * plan.per
+    row0, chunk = _ba_block(unit % plan.groups, plan, bplan)
+    c = first + chunk
     c = (c < BA_SPLITS).select(c, i32(BA_SPLITS - 1))
     return (
         tiled.issue_unit(g.bid, g.tid, proj_weights(w), plan),
-        _ba_issue(g, ba_weights(w), c),
+        _ba_issue(g, ba_weights(w), c, row0),
     )
 
 
-def _ba_issue(g, bw, c):
-    return bw.issue(g.wave * 16 + g.lane % 16, c, g.lane // 16)
+def _ba_block(group, plan, bplan):
+    """(first row or None, stage chunk) of the [b | a] work projection group
+    `group` carries at the resident widths: groups `r per .. r per + per - 1`
+    take the chunks of 64-row block `r`, one block up to 64 [b | a] rows (TP2),
+    two at TP1 (96 rows). A group past them gets the last block's rows."""
+    if bplan.groups == 1:
+        return None, group
+    block = group // plan.per
+    block = (block < bplan.groups).select(block, i32(bplan.groups - 1))
+    return block * bplan.unit_rows, group % plan.per
+
+
+def _ba_row(g, row0):
+    """The wave's first [b | a] row: 16 a wave from the block's `row0`."""
+    return g.wave * 16 if row0 is None else row0 + g.wave * 16
+
+
+def _ba_issue(g, bw, c, row0=None):
+    """The lane's loads of [b | a] chunk `c` of the 64 rows from `row0` (a row
+    past `BA` reads the last)."""
+    return bw.issue(_ba_row(g, row0) + g.lane % 16, c, g.lane // 16)
 
 
 def _conv_tokens(rows: int, lane, tiles: int):

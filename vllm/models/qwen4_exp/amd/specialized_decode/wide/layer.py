@@ -78,7 +78,9 @@ class LayerBuild:
     stats: bool = False  # the input state came from vLLM: compute its rrms first
     qkvz_shuffled: bool = False  # in_proj_qkvz on AITER's ASM FP4 GEMM layout
     out_shuffled: bool = False  # out_proj likewise
-    rip: int = 384  # the experts' padded intermediate rows a rank
+    # the experts' padded intermediate rows a rank: TP2's by default; a TP1
+    # caller passes the weights'
+    rip: int = 384
     hc_eps: float = 1e-6
     gdn_eps: float = 1e-6
     trace: bool = False  # CTA 0 stamps the clock at every phase end (``phase_names``)

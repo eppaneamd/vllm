@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The shapes the wide kernels are compiled for: Qwen3.8-Flash-Next, one rank's
-share at TP2 (`shard`). `SHAPES` is what the runtime checks the checkpoint's
-text config against; every other constant follows from it."""
+share at TP1 or TP2 (`shard`). `SHAPES` is what the runtime checks the
+checkpoint's text config against; every other constant follows from it."""
 
 import functools
 from typing import NamedTuple
 
-TPS = (2,)  # the tensor parallel sizes the kernels are built for
+TPS = (1, 2)  # the tensor parallel sizes the kernels are built for
 
 # the checkpoint's text config (``SHAPE_NAMES``), TP-independent
 HIDDEN = 2560
@@ -71,7 +71,9 @@ LDS_BYTES = 160 * 1024
 # rows a step: the CUDA graph capture sizes in `MIN_TOKENS .. Shard.MAX_TOKENS`
 # get a build
 MIN_TOKENS = 1
-_MAX_TOKENS = {2: 192}
+# TP1 stops at 64: the gain over vLLM's TP1 decode falls with the width, and an
+# earlier TP1 build of these kernels was slower than it above 64 rows
+_MAX_TOKENS = {1: 64, 2: 192}
 
 
 class Shard(NamedTuple):

@@ -311,8 +311,8 @@ class KernelConfig:
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: persistent kernels that run most or all of one decoder layer
     in one or a few launches (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
-    MI355X; Qwen3.8-Flash-Next MXFP4 on MI355X with tensor parallel size 2, for
-    decode steps of 1-192 requests; Muse Spark MXFP4 on MI355X with tensor
+    MI355X; Qwen3.8-Flash-Next MXFP4 on MI355X at TP1 or TP2, for decode steps of
+    1-64 (TP1) or 1-192 (TP2) requests; Muse Spark MXFP4 on MI355X with tensor
     parallel size 8, expert parallelism and a 7-token DSpark draft, for
     speculative verify steps of 1-16 requests, with bf16 MoE activations instead
     of the checkpoint's MXFP4). A deployment that cannot run it is refused at

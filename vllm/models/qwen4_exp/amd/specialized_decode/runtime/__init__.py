@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen3.8-Flash-Next specialized decode on MI355X (TP2), enabled by
+"""Qwen3.8-Flash-Next specialized decode on MI355X (TP1 or TP2), enabled by
 `--monokernel` (`KernelConfig.monokernel`).
 
 `specialized_decode_config` runs in the model's `__init__`, before the
@@ -23,15 +23,21 @@ NAME = "Qwen3.8-Flash-Next specialized decode (--monokernel)"
 @dataclass(frozen=True)
 class DecodeConfig:
     """`widths`: the step widths (rows) the wide kernels are built for, the
-    deployment's CUDA graph capture sizes in [MIN_TOKENS, MAX_TOKENS]; a step
-    of another width runs vLLM's decode."""
+    deployment's CUDA graph capture sizes in [MIN_TOKENS, `Shard.MAX_TOKENS`]
+    at its TP; a step of another width runs vLLM's decode."""
 
     widths: tuple[int, ...]
 
 
 def decode_widths(vllm_config) -> tuple[int, ...]:
+    """The capture sizes the kernels are built for; () at a TP outside
+    `L.TPS` (`unsupported` reports it)."""
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    if tp not in L.TPS:
+        return ()
+    cap = L.shard(tp).MAX_TOKENS
     sizes = vllm_config.compilation_config.cudagraph_capture_sizes or ()
-    return tuple(sorted(s for s in set(sizes) if L.MIN_TOKENS <= s <= L.MAX_TOKENS))
+    return tuple(sorted(s for s in set(sizes) if L.MIN_TOKENS <= s <= cap))
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -42,10 +48,11 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         return None
     reasons = unsupported(vllm_config)
     widths = decode_widths(vllm_config)
-    if not widths:
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    if not widths and tp in L.TPS:
         reasons.append(
-            f"no CUDA graph capture size in {L.MIN_TOKENS}-{L.MAX_TOKENS}: the wide "
-            "kernels serve FULL decode graphs of those widths"
+            f"no CUDA graph capture size in {L.MIN_TOKENS}-{L.shard(tp).MAX_TOKENS} "
+            f"at TP{tp}: the wide kernels serve FULL decode graphs of those widths"
         )
     if reasons:
         raise ValueError(

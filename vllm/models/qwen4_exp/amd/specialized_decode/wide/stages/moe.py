@@ -98,6 +98,9 @@ class Shape:
         self.agroups = ri // mx.GROUP  # scale groups an intermediate row
         self.half_tiles = self.up_tiles * WAVES // 2
         self.half_groups = self.agroups // 2
+        # a K step loads 2 * `up_tiles` 16-byte pieces a lane: three steps in
+        # flight spill registers at 10 tiles
+        self.up_depth = DEPTH if self.up_tiles <= 5 else 2
         self.assignments = rows * SLOTS
         self.mask_words = -(-rows // 32)
         self.max_units = min(E_ALL, self.assignments) + self.assignments // TILE
@@ -137,7 +140,8 @@ def lds_words(shape: Shape) -> LdsWords:
         index=shape.index_words,
         units=3 * shape.max_units,
         scan=8,
-        x=TILE * HIDDEN // 8,
+        # the gathered rows, or the f32 bridge panel over them if it is larger
+        x=max(TILE * HIDDEN // 8, TILE * shape.ri),
         xs=TILE * XGROUPS,
         act=TILE * shape.ri // 8,
         acts=TILE * shape.agroups,
@@ -413,7 +417,8 @@ def unit_slot(bid):
 
 # A half piece: half the intermediate rows of a unit (gate, up and the down
 # projection's K), `Shape.half_tiles` 16-row tiles of each of gate and up over
-# the waves as (first, count) = (0, 3), (3, 3), (6, 2), (8, 2) at TP2.
+# the waves, the first `half_tiles % WAVES` one more: (first, count) = (0, 3),
+# (3, 3), (6, 2), (8, 2) at TP2, (5 * wave, 5) at TP1.
 
 
 def pieces(n):
@@ -517,9 +522,17 @@ def unit(
     lane, wave = g.lane, g.wave
     whole = half == 0
     hh = half - 1
-    # the wave's gate/up tiles: 5 of the unit's 20, or 3/3/2/2 of a half's 10
-    first = (wave < 2).select(wave * 3, wave * 2 + 2)
-    tiles = whole.select(i32(s.up_tiles), (wave < 2).select(i32(3), i32(2)))
+    # the wave's gate/up tiles: `up_tiles` of the unit's, or its share of a
+    # half's `half_tiles` (3/3/2/2 of 10 at TP2, 5 of 20 at TP1)
+    per, extra = divmod(s.half_tiles, WAVES)
+    if const_expr(extra):
+        first = (wave < extra).select(wave * (per + 1), wave * per + extra)
+        tiles = whole.select(
+            i32(s.up_tiles), (wave < extra).select(i32(per + 1), i32(per))
+        )
+    else:
+        first = wave * per
+        tiles = whole.select(i32(s.up_tiles), i32(per))
 
     def group_live(q):
         return whole | (q // s.half_groups == hh)
@@ -547,8 +560,16 @@ def unit(
             )
         if const_expr(k % 2 == 0):
             for proj in range_constexpr(2):
-                for pair in range_constexpr((s.up_tiles + 1) // 2):
-                    tp = base_tile // 2 + proj * (rip_tiles // 2) + pair
+                for pair in range_constexpr(s.up_tiles // 2 + 1):
+                    if const_expr(s.up_tiles % 2 == 0):
+                        # an even first tile leaves the wave's last pair
+                        # unused; unclamped, the last wave's would read past
+                        # the projection: the next expert's scales, or past
+                        # the scale tensor's end after the last expert
+                        tp = fx.min(base_tile // 2 + pair, i32(rip_tiles // 2 - 1))
+                        tp = tp + proj * (rip_tiles // 2)
+                    else:
+                        tp = base_tile // 2 + proj * (rip_tiles // 2) + pair
                     scales[proj, pair, k // 2] = ld(
                         us, (tp * scale_tiles + k // 2) * 64 + lane, fx.Int32, cm=CM_NT
                     )
@@ -568,9 +589,10 @@ def unit(
             sa = (code >> (odd * 8)) & 0x00FF00FF
             accs[t] = mfma_f4(weights[t], xb, accs[t], sa, xc, opsel_a=2 * (k % 2))
 
-    pipelined(HIDDEN // 128, DEPTH, issue, compute)
+    pipelined(HIDDEN // 128, s.up_depth, issue, compute)
     fx.barrier()
     # the f32 bridge panel [16 tokens][ri] aliases the gathered rows
+    assert TILE * s.ri <= lds_words(s).x, "the bridge panel fits lds.x"
     for t in range_constexpr(s.up_tiles):
         if i32(t) < tiles:
             col = (base_tile + t) * TILE + group * 4

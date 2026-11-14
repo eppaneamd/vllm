@@ -36,9 +36,10 @@ from vllm.models.qwen4_exp.amd.specialized_decode.wide.stages import tiled
 
 IX_HEADS, IX_DIM = 4, 128  # the indexer's query heads (one key head), dims
 IX = (IX_HEADS + 1) * IX_DIM  # 640, replicated
-QKV_SPLITS = {2: 2}  # by TP: 104 row groups x 2 = 208 units
+QKV_SPLITS = {1: 1, 2: 2}  # by TP: 208 row groups x 1, 104 x 2 = 208 units
 IX_SPLITS = 4  # 10 row groups x 4 = 40 units, on CTAs 208 ..
-FOLD_IX = {2: 128}  # by TP: the ix groups' first fold counter (after the qkv groups')
+# by TP: the ix groups' first fold counter (after the qkv groups')
+FOLD_IX = {1: 256, 2: 128}
 
 
 def i32(v):

@@ -52,12 +52,14 @@ from vllm.platforms import current_platform
 TRACE = False
 
 
-def allreduce_codec() -> str:
+def allreduce_codec(tp: int) -> str:
     """The TP exchange's line codec: QuickReduce's INT4 codec when the
     deployment asks QuickReduce for INT4 (or INT3) all-reduces
-    (`VLLM_ROCM_QUICK_REDUCE_QUANTIZATION`), else exact bf16 lines."""
+    (`VLLM_ROCM_QUICK_REDUCE_QUANTIZATION`), else exact bf16 lines. At TP1
+    the exchange is a round trip through the rank's own mailbox and vLLM
+    runs no all-reduce, so INT4 lines would only lose accuracy: bf16."""
     level = envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION
-    return "int4" if level in ("INT4", "INT3") else "bf16"
+    return "int4" if tp > 1 and level in ("INT4", "INT3") else "bf16"
 
 
 def _hc_args(hc, prefix: str) -> dict:
@@ -112,7 +114,7 @@ class Launcher:
         self.folds = base + 4 * FOLD_BASE
         self.rip = experts_rip(next(ly.mlp for ly in model.layers))
         self.traced = TRACE
-        self.allreduce = allreduce_codec()
+        self.allreduce = allreduce_codec(tp)
         self.trace = torch.zeros(
             len(model.layers) * K.TRACE_WORDS, dtype=torch.int64, device=dev
         )
@@ -321,8 +323,8 @@ def qsa_core(attn, x, qkv, ixqk, positions) -> tuple[torch.Tensor, torch.Tensor]
     and indexer caches; `indexer.Prep`), scores the compressed blocks and
     selects them (the decode top-k's set; a row within the budget takes all
     of its blocks unscored), and `wide.attention` attends their tokens in
-    place (other cache formats run vLLM's whole QSA; other ropes or metadata
-    vLLM's prepare)."""
+    place (other cache formats, and TP1's two kv heads a rank, run vLLM's
+    whole QSA; other ropes or metadata vLLM's prepare)."""
     from vllm.models.qwen4_exp.amd import qsa
 
     n = x.shape[0]
